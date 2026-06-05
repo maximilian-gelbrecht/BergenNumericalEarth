@@ -42,10 +42,6 @@ Base.@kwdef struct NetCDFVar
     level::Any = nothing
 end
 
-# ----------------------------------------------------------------------------
-# Loading
-# ----------------------------------------------------------------------------
-
 """
     load_variable(path, name; level=nothing) -> Array{Float32}
 
