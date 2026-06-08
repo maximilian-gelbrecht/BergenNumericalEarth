@@ -1,5 +1,5 @@
 #!/usr/bin/env -S julia +1.12 --project
-# Preprocess a global NetCDF file into a point-wise, land-only Zarr store.
+# Preprocess a global NetCDF file into a column-wise, land-only Zarr store.
 #
 # Usage:
 #   julia +1.12 --project=. run_preprocessing.jl <input.nc> [output.zarr]

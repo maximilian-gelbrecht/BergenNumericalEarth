@@ -30,6 +30,8 @@ function LearnedSurfaceRoughness(
         kwargs...
     )
 
+    lux_device = MLDataDevices.get_device(SG.architecture)
+
     # Set up Lux NN, if it's not provided
     if isnothing(land_nn) 
         land_nn = Lux.Chain(
@@ -43,7 +45,7 @@ function LearnedSurfaceRoughness(
         )
 
         rng = Random.default_rng()
-        land_params, rand_states = Lux.setup(rng, land_nn)
+        land_params, rand_states = Lux.setup(rng, land_nn) |> lux_device
         land_states = Lux.testmode(rand_states)
     end
 

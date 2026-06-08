@@ -1,9 +1,4 @@
-# Point-wise / column-wise dataloaders for training Lux.jl models.
-#
-# This is the SECOND stage of the pipeline. It consumes the Zarr store produced
-# by preprocessing.jl (`preprocess_to_zarr`), which already holds land-only,
-# NaN-free, point-wise data: one array per variable keyed by name, with the
-# input/target bookkeeping in the group attributes.
+# Column-wise dataloaders for training Lux.jl models.
 #
 # Here we only assemble those arrays into model-ready batches:
 #   * vertically stack the input variables into a feature matrix X,
@@ -14,10 +9,6 @@
 # the trailing dimension is the batch axis Lux expects.
 
 using Zarr, MLUtils, Random
-
-# ----------------------------------------------------------------------------
-# Normalisation helpers
-# ----------------------------------------------------------------------------
 
 "Per-feature (per-row) mean and standard deviation across all samples."
 function feature_mean_std(X::AbstractMatrix)
@@ -33,14 +24,10 @@ function standardize(X::AbstractMatrix, μ::AbstractVector, σ::AbstractVector)
     return (X .- μ) ./ σsafe
 end
 
-# ----------------------------------------------------------------------------
-# Read the preprocessed Zarr store
-# ----------------------------------------------------------------------------
-
 """
     load_zarr_dataset(zarr_path; normalize=true, target_transform=identity)
 
-Read the point-wise dataset written by `preprocess_to_zarr`. Stacks the input
+Read the column-wise dataset written by `preprocess_to_zarr`. Stacks the input
 variables (in the stored `input_names` order) into `X :: (features, samples)` and
 reads the target into `Y :: (targets, samples)`.
 
@@ -73,10 +60,6 @@ function load_zarr_dataset(zarr_path::AbstractString;
 
     return (; X, Y, input_mean, input_std, target_mean, target_std, input_names, target_name)
 end
-
-# ----------------------------------------------------------------------------
-# MLUtils.DataLoader wrapping
-# ----------------------------------------------------------------------------
 
 """
     pointwise_dataloaders(zarr_path; batchsize=1024, split=0.8, shuffle=true,

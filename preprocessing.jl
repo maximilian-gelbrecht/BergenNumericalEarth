@@ -1,8 +1,8 @@
-# Preprocessing: global NetCDF fields -> point-wise Zarr store prepared for dataloaders
+# Preprocessing: global NetCDF fields -> column-wise Zarr store prepared for dataloaders
 #
 #   1. Read the requested variables from one (or several) NetCDF files. We work
 #      with land variables, several of which carry missing values over the ocean.
-#   2. Flatten every field point-wise: each grid point (at each time step) becomes
+#   2. Flatten every field column-wise: each grid point (at each time step) becomes
 #      one sample / column.
 #   3. Drop every sample that is NaN/missing in ANY input or the target, so that
 #      the Zarr — and therefore the dataloaders — never see an invalid value.
@@ -88,7 +88,7 @@ end
 """
     preprocess_to_zarr(inputs, target, zarr_path; chunk_samples=8192, overwrite=true, compressor=...)
 
-Build the point-wise dataset from NetCDF and persist it as a Zarr group.
+Build the column-wise dataset from NetCDF and persist it as a Zarr group.
 
 Arguments
   * `inputs::Vector{NetCDFVar}` – the predictor variables (land variables).
