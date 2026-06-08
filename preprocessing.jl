@@ -113,14 +113,22 @@ Returns a summary NamedTuple `(; path, input_names, target_name, n_samples, n_dr
 """
 function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFVar,
         zarr_path::AbstractString; chunk_samples::Int = 8192, overwrite::Bool = true,
-        compressor = Zarr.BloscCompressor(cname = "zstd", clevel = 5, shuffle = 1))
+        compressor = Zarr.BloscCompressor(cname = "zstd", clevel = 5, shuffle = 1),
+        verbose::Bool = true)
 
     # name -> flattened (features, samples) matrix, inputs first then target
     vars = NetCDFVar[inputs..., target]
     names = String[v.name for v in vars]
     allunique(names) || error("variable names must be unique (they key the Zarr arrays); got $(names)")
 
-    fields = [flatten_pointwise(load_field(v)) for v in vars]
+    verbose && @info "Preprocessing → $(zarr_path): loading $(length(vars)) variables from NetCDF"
+    fields = map(enumerate(vars)) do (i, v)
+        t = time()
+        f = flatten_pointwise(load_field(v))
+        verbose && @info "  loaded [$i/$(length(vars))] $(v.name)" features=size(f, 1) samples=size(f, 2) seconds=round(time() - t; digits = 2)
+        f
+    end
+
     nsamples = size(first(fields), 2)
     all(f -> size(f, 2) == nsamples, fields) ||
         error("all variables must share the same lat×lon×time grid (sample count mismatch)")
@@ -132,6 +140,7 @@ function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFV
     end
     nkept = count(valid)
     nkept > 0 || error("no valid land samples remain after filtering missings")
+    verbose && @info "  filtered missing/ocean samples" kept=nkept dropped=(nsamples - nkept) keep_fraction=round(nkept / nsamples; digits = 3)
 
     if overwrite && ispath(zarr_path)
         rm(zarr_path; recursive = true, force = true)
@@ -143,13 +152,17 @@ function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFV
         "n_samples"   => nkept,
     ))
 
-    for (name, f) in zip(names, fields)
+    verbose && @info "  writing $(length(names)) compressed arrays to Zarr"
+    for (i, (name, f)) in enumerate(zip(names, fields))
         clean = f[:, valid]                              # land-only, NaN-free
+        t = time()
         z = zcreate(Float32, g, name, size(clean)...;
                     chunks = (size(clean, 1), min(chunk_samples, nkept)),
                     compressor = compressor)
         z[:, :] = clean
+        verbose && @info "  wrote [$i/$(length(names))] $(name)" size=size(clean) seconds=round(time() - t; digits = 2)
     end
+    verbose && @info "Preprocessing done" path=zarr_path n_samples=nkept
 
     return (; path = zarr_path,
               input_names = String[v.name for v in inputs],
