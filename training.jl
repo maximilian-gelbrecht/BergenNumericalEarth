@@ -98,18 +98,12 @@ end
 # Example usage (end to end with dataloaders.jl)
 # ----------------------------------------------------------------------------
 #
-#   inputs = [
-#       NetCDFVar(path = "vegetation_high.nc", name = "cvh"),
-#       NetCDFVar(path = "vegetation_low.nc",  name = "cvl"),
-#       NetCDFVar(path = "geopotential.nc",    name = "z",    level = 1),
-#       NetCDFVar(path = "snow_depth.nc",      name = "sd"),
-#       NetCDFVar(path = "soil.nc",            name = "stl",  level = 4),
-#       NetCDFVar(path = "soil.nc",            name = "swvl", level = 1),
-#   ]
-#   target = NetCDFVar(path = "surface_roughness.nc", name = "fsr")
-#
+#   # 1. preprocess NetCDF -> Zarr once (see preprocessing.jl):
+#   #    preprocess_to_zarr(inputs, target, "surface_roughness.zarr")
+#   #
+#   # 2. build dataloaders from the Zarr store:
 #   train_loader, val_loader, stats =
-#       pointwise_dataloaders(inputs, target; batchsize = 2048, target_transform = log)
+#       pointwise_dataloaders("surface_roughness.zarr"; batchsize = 2048, target_transform = log)
 #
 #   # hand over your own model (e.g. the Chain from LearnedSurfaceRoughness);
 #   # its input width must match size(first(train_loader)[1], 1).
