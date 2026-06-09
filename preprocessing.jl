@@ -70,6 +70,16 @@ function load_var_slice(ds, name::AbstractString, tidx; level = nothing)
     return arr
 end
 
+"""
+    subsample_time(idx, stride) -> indices
+
+Keep every `stride`-th time index (`stride ≤ 1` keeps all). Works on both ranges
+(the whole-file case) and `Vector{Int}` (a single year's indices), preserving the
+type so contiguous reads stay contiguous.
+"""
+subsample_time(idx, stride::Integer) =
+    stride <= 1 ? idx : idx[firstindex(idx):stride:lastindex(idx)]
+
 "Map each calendar year to the time indices belonging to it (from the CF-decoded time coordinate)."
 function year_indices(ds, time_name::AbstractString)
     haskey(ds, time_name) || error("time coordinate '$(time_name)' not found in dataset")
@@ -118,8 +128,9 @@ function flatten_pointwise(arr::AbstractArray)
 end
 
 """
-    preprocess_to_zarr(inputs, target, zarr_path; years=nothing, time_name="time",
-                       chunk_samples=8192, overwrite=true, compressor=..., verbose=true)
+    preprocess_to_zarr(inputs, target, zarr_path; years=nothing, time_name="valid_time",
+                       time_stride=1, chunk_samples=2^22, overwrite=true,
+                       compressor=..., verbose=true)
 
 Build the column-wise dataset from a big multi-year NetCDF file and persist it as a
 Zarr group, loading only one year's time-slice into RAM at a time.
@@ -139,6 +150,19 @@ Memory model
     variables), then append the surviving land-only columns to each variable's Zarr
     array. Masks may differ year to year — that is fine, since samples are stored
     column-wise.
+  * `time_stride` thins the time axis before flattening (keep every `stride`-th
+    step; `1` keeps all). The surface fields here are highly redundant in time
+    (orography/geopotential is constant, vegetation cover is near-constant, surface
+    roughness is quasi-static), so a large stride cuts the sample count — and hence
+    the on-disk chunk count — by that factor with little loss. For 3-hourly data:
+    `8`≈daily, `56`≈weekly, `240`≈monthly.
+
+`chunk_samples` is the chunk width along the sample axis; the Zarr directory store
+writes one file per chunk, so the file count is roughly
+`(total_samples / chunk_samples) × n_variables`. Keep it large (default `2^20`) and
+use `time_stride` to keep `total_samples` modest, or the store explodes into
+millions of tiny files. The default `2^22` (~16 MiB chunks) keeps this file at a
+few thousand chunk files for typical strides.
 
 Output
   * One array per variable, keyed by `NetCDFVar.name`, of shape `(features,
@@ -156,7 +180,7 @@ Returns `(; path, input_names, target_name, n_samples, n_dropped, years)`.
 """
 function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFVar,
         zarr_path::AbstractString; years = nothing, time_name::AbstractString = "valid_time",
-        chunk_samples::Int = 8192, overwrite::Bool = true,
+        time_stride::Int = 55, chunk_samples::Int = 1 << 22, overwrite::Bool = true,
         compressor = Zarr.BloscCompressor(cname = "zstd", clevel = 5, shuffle = 1),
         verbose::Bool = true)
 
@@ -167,12 +191,15 @@ function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFV
     # open each distinct file once and keep the handles for the whole run
     datasets = Dict(p => NCDataset(p) for p in unique(v.path for v in vars))
     try
-        # chunks = list of (label, path -> time indices). `nothing` years -> whole file.
+        # chunks = list of (label, path -> time indices), subsampled by `time_stride`.
+        # `nothing` years -> the whole file as one chunk.
         chunks = if isnothing(years)
-            [("all", Dict(p => Colon() for p in keys(datasets)))]
+            [("all", Dict(p => subsample_time(1:length(datasets[p][time_name]), time_stride)
+                          for p in keys(datasets)))]
         else
             file_year_idx = Dict(p => year_indices(datasets[p], time_name) for p in keys(datasets))
-            [(string(y), Dict(p => get(file_year_idx[p], y, Int[]) for p in keys(datasets))) for y in years]
+            [(string(y), Dict(p => subsample_time(get(file_year_idx[p], y, Int[]), time_stride)
+                              for p in keys(datasets))) for y in years]
         end
 
         verbose && @info "Preprocessing → $(zarr_path)" variables=length(vars) years=(isnothing(years) ? "all" : length(chunks))

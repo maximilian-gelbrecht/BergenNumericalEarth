@@ -2,13 +2,18 @@
 # Preprocess a big multi-year NetCDF file into a column-wise, land-only Zarr store.
 #
 # Usage:
-#   julia +1.12 --project=. run_preprocessing.jl <input.nc> [output.zarr] [years]
+#   julia +1.12 --project=. run_preprocessing.jl <input.nc> [output.zarr] [years] [stride=N]
 #
 #   <input.nc>     big NetCDF file holding all input variables and the target.
 #   [output.zarr]  output Zarr store (default: "surface_roughness.zarr").
 #   [years]        years to process, e.g. 2000:2020, 2000-2020 or 2000,2005,2010.
 #                  Only one year is held in memory at a time. Omit to process the
 #                  whole file at once.
+#   [stride=N]     keep every N-th time step (default 1 = all). The surface fields
+#                  are highly redundant in time; for 3-hourly data 8≈daily,
+#                  56≈weekly, 240≈monthly. Cuts samples (and chunk files) by N.
+#   [chunk=N]      Zarr chunk width along samples (default 2^22 ≈ 4.2M, ~16 MiB).
+#                  files ≈ (samples / chunk) × n_vars.
 
 import Pkg
 Pkg.activate(@__DIR__)
@@ -16,11 +21,13 @@ Pkg.activate(@__DIR__)
 include(joinpath(@__DIR__, "preprocessing.jl"))
 
 const USAGE = """
-Usage: julia +1.12 --project=. run_preprocessing.jl <input.nc> [output.zarr] [years]
+Usage: julia +1.12 --project=. run_preprocessing.jl <input.nc> [output.zarr] [years] [stride=N]
 
   <input.nc>     big NetCDF file with all input variables and the target.
   [output.zarr]  output Zarr store (default: surface_roughness.zarr).
   [years]        e.g. 2000:2020, 2000-2020 or 2000,2005,2010 (omit = whole file).
+  [stride=N]     keep every N-th time step (default 1); 3-hourly: 8≈daily, 240≈monthly.
+  [chunk=N]      Zarr chunk width along samples (default 2^22 ≈ 4.2M, ~16 MiB).
 """
 
 "Does an argument look like a year range/list (e.g. 2000:2020, 2000-2020, 2000,2005)?"
@@ -48,11 +55,21 @@ function main(args)
     file = args[1]
     isfile(file) || error("input NetCDF file not found: $(file)")
 
-    # remaining args: an output path and/or a years spec, in any order
+    # remaining args: an output path, a years spec, and/or stride=N, in any order
     zarr_path = "surface_roughness.zarr"
     years = nothing
+    time_stride = 1
+    chunk_samples = nothing            # nothing -> use preprocess_to_zarr's default
     for a in args[2:end]
-        looks_like_years(a) ? (years = parse_years(a)) : (zarr_path = a)
+        if (m = match(r"^stride=(\d+)$", a)) !== nothing
+            time_stride = parse(Int, m.captures[1])
+        elseif (m = match(r"^chunk=(\d+)$", a)) !== nothing
+            chunk_samples = parse(Int, m.captures[1])
+        elseif looks_like_years(a)
+            years = parse_years(a)
+        else
+            zarr_path = a
+        end
     end
 
     inputs = [
@@ -65,7 +82,9 @@ function main(args)
     ]
     target = NetCDFVar(path = file, name = "fsr")  # surface roughness
 
-    info = preprocess_to_zarr(inputs, target, zarr_path; years)
+    kw = (; years, time_stride)
+    chunk_samples === nothing || (kw = (; kw..., chunk_samples))
+    info = preprocess_to_zarr(inputs, target, zarr_path; kw...)
     @info "preprocessed" info.path info.n_samples info.n_dropped
     return info
 end
