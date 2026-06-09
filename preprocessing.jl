@@ -1,15 +1,15 @@
 # Preprocessing: global NetCDF fields -> column-wise Zarr store prepared for dataloaders
 #
-#   1. Read the requested variables from one (or several) NetCDF files. We work
-#      with land variables, several of which carry missing values over the ocean.
+#   1. Read the requested variables from one big multi-year NetCDF file, loading only
+#      a single year's time-slice into RAM at a time. We work with land variables,
+#      several of which carry missing values over the ocean.
 #   2. Flatten every field column-wise: each grid point (at each time step) becomes
 #      one sample / column.
 #   3. Drop every sample that is NaN/missing in ANY input or the target, so that
 #      the Zarr — and therefore the dataloaders — never see an invalid value.
-#   4. Write each variable's filtered array into a Zarr group, keyed by its name,
-#      with the input/target bookkeeping stored as group attributes.
+#   4. Append each year's filtered, land-only columns to a per-variable Zarr array.
 
-using NCDatasets, Zarr
+using NCDatasets, Zarr, Dates
 
 """
     NetCDFVar(; path, name, level=nothing)
@@ -51,6 +51,38 @@ end
 
 load_field(v::NetCDFVar) = load_variable(v.path, v.name; level = v.level)
 
+"""
+    load_var_slice(ds, name, tidx; level=nothing) -> Array{Float32}
+
+Read variable `name` from the already-open dataset `ds`, restricted to time indices
+`tidx` along the last dimension (`Colon()` loads all times). Only the requested
+slices are read from disk. missings -> `NaN`; an optional `level` is selected.
+"""
+function load_var_slice(ds, name::AbstractString, tidx; level = nothing)
+    var = ds[name]
+    arr = ndims(var) == 3 ? var[:, :, tidx] :
+          ndims(var) == 4 ? var[:, :, :, tidx] :
+          error("expected a 3D (lat,lon,time) or 4D (lat,lon,level,time) variable '$(name)', got $(ndims(var))D")
+    arr = to_float32_nan(arr)
+    if level !== nothing && ndims(arr) == 4
+        arr = arr[:, :, level, :]
+    end
+    return arr
+end
+
+"Map each calendar year to the time indices belonging to it (from the CF-decoded time coordinate)."
+function year_indices(ds, time_name::AbstractString)
+    haskey(ds, time_name) || error("time coordinate '$(time_name)' not found in dataset")
+    times = ds[time_name][:]
+    eltype(times) <: Dates.TimeType ||
+        error("time coordinate '$(time_name)' is not CF-decoded to dates (eltype $(eltype(times))); cannot split by year")
+    idx = Dict{Int, Vector{Int}}()
+    for (i, t) in enumerate(times)
+        push!(get!(idx, Int(Dates.year(t)), Int[]), i)
+    end
+    return idx
+end
+
 "Convert any array (possibly holding `missing`) to a dense `Float32` array with `NaN` for missings."
 function to_float32_nan(arr::AbstractArray)
     out = Array{Float32}(undef, size(arr))
@@ -86,91 +118,134 @@ function flatten_pointwise(arr::AbstractArray)
 end
 
 """
-    preprocess_to_zarr(inputs, target, zarr_path; chunk_samples=8192, overwrite=true, compressor=...)
+    preprocess_to_zarr(inputs, target, zarr_path; years=nothing, time_name="time",
+                       chunk_samples=8192, overwrite=true, compressor=..., verbose=true)
 
-Build the column-wise dataset from NetCDF and persist it as a Zarr group.
+Build the column-wise dataset from a big multi-year NetCDF file and persist it as a
+Zarr group, loading only one year's time-slice into RAM at a time.
 
 Arguments
   * `inputs::Vector{NetCDFVar}` – the predictor variables (land variables).
   * `target::NetCDFVar`         – the target variable (e.g. surface roughness).
   * `zarr_path::AbstractString` – directory store to create.
 
-What it does
-  * Loads and flattens every variable to `(features, samples)`.
-  * Builds one joint mask: a sample is kept only if every input AND the
-    target are finite there. This removes ocean / missing points up front, so the
-    Zarr contains land-only, NaN-free data.
-  * Writes one array per variable, keyed by `NetCDFVar.name`, chunked along the
-    sample dimension and compressed with `compressor`. Group attributes record
-    `input_names`, `target_name` and `n_samples` so the dataloader is fully
-    self-describing.
+Memory model
+  * `years` is the collection of calendar years to process (e.g. `2000:2020`). The
+    CF-decoded `time_name` coordinate is used to find each year's time indices, and
+    every variable is read sliced to those indices — so only one year of data is in
+    memory at once. With `years=nothing` the whole file is processed in one go.
+  * Each year is handled independently in a single pass: load all variables for the
+    year, drop every sample that is missing in ANY of them (the join across
+    variables), then append the surviving land-only columns to each variable's Zarr
+    array. Masks may differ year to year — that is fine, since samples are stored
+    column-wise.
 
-`compressor` controls on-disk compression (Blosc + zstd by default); pass
-`nothing` to store uncompressed. Compression is applied per chunk, so `chunk_samples`
-also sets the compression block granularity.
+Output
+  * One array per variable, keyed by `NetCDFVar.name`, of shape `(features,
+    n_samples)`, grown year by year, chunked along the sample dimension and
+    compressed with `compressor`. Group attributes record `input_names` and
+    `target_name`; `n_samples` is simply each array's width.
 
-Returns a summary NamedTuple `(; path, input_names, target_name, n_samples, n_dropped)`.
+`compressor` controls on-disk compression (Blosc + zstd by default); pass `nothing`
+to store uncompressed. `verbose` logs per-(variable, year) progress and timings.
+
+Assumes all variables share the same `time` axis (same timestamps in the same
+order — the usual case for one file).
+
+Returns `(; path, input_names, target_name, n_samples, n_dropped, years)`.
 """
 function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFVar,
-        zarr_path::AbstractString; chunk_samples::Int = 8192, overwrite::Bool = true,
+        zarr_path::AbstractString; years = nothing, time_name::AbstractString = "time",
+        chunk_samples::Int = 8192, overwrite::Bool = true,
         compressor = Zarr.BloscCompressor(cname = "zstd", clevel = 5, shuffle = 1),
         verbose::Bool = true)
 
-    # name -> flattened (features, samples) matrix, inputs first then target
-    vars = NetCDFVar[inputs..., target]
+    vars  = NetCDFVar[inputs..., target]            # inputs first, target last
     names = String[v.name for v in vars]
     allunique(names) || error("variable names must be unique (they key the Zarr arrays); got $(names)")
 
-    verbose && @info "Preprocessing → $(zarr_path): loading $(length(vars)) variables from NetCDF"
-    fields = map(enumerate(vars)) do (i, v)
-        t = time()
-        f = flatten_pointwise(load_field(v))
-        verbose && @info "  loaded [$i/$(length(vars))] $(v.name)" features=size(f, 1) samples=size(f, 2) seconds=round(time() - t; digits = 2)
-        f
+    # open each distinct file once and keep the handles for the whole run
+    datasets = Dict(p => NCDataset(p) for p in unique(v.path for v in vars))
+    try
+        # chunks = list of (label, path -> time indices). `nothing` years -> whole file.
+        chunks = if isnothing(years)
+            [("all", Dict(p => Colon() for p in keys(datasets)))]
+        else
+            file_year_idx = Dict(p => year_indices(datasets[p], time_name) for p in keys(datasets))
+            [(string(y), Dict(p => get(file_year_idx[p], y, Int[]) for p in keys(datasets))) for y in years]
+        end
+
+        verbose && @info "Preprocessing → $(zarr_path)" variables=length(vars) years=(isnothing(years) ? "all" : length(chunks))
+
+        # create the group; per-variable arrays are created lazily on first write,
+        # taking their feature-row count from the loaded slice.
+        if overwrite && ispath(zarr_path)
+            rm(zarr_path; recursive = true, force = true)
+        end
+        g = zgroup(zarr_path; attrs = Dict(
+            "input_names" => String[v.name for v in inputs],
+            "target_name" => target.name,
+        ))
+        arrays = Dict{String, Any}()
+
+        total_kept = total_seen = 0
+        for (label, idxmap) in chunks
+            # skip a requested year that is absent from any file
+            if any(idxmap[v.path] isa AbstractVector && isempty(idxmap[v.path]) for v in vars)
+                verbose && @warn "  year $(label): no data in at least one file, skipping"
+                continue
+            end
+
+            # load every variable for this year and build the joint land mask
+            fields = Dict{String, Any}()
+            mask = nothing
+            for v in vars
+                t = time()
+                f = flatten_pointwise(load_var_slice(datasets[v.path], v.name, idxmap[v.path]; level = v.level))
+                fields[v.name] = f
+                m = vec(all(isfinite, f; dims = 1))
+                if isnothing(mask)
+                    mask = m
+                else
+                    length(m) == length(mask) ||
+                        error("sample-count mismatch in year $(label) for '$(v.name)': $(length(m)) vs $(length(mask))")
+                    mask .&= m
+                end
+                verbose && @info "  $(label) · loaded $(v.name)" features=size(f, 1) samples=size(f, 2) seconds=round(time() - t; digits = 2)
+            end
+
+            nseen = length(mask)
+            k = count(mask)
+            total_seen += nseen
+            total_kept += k
+
+            # append this year's land-only, NaN-free columns to each variable's array
+            # (created lazily on first write, with its feature-row count from the slice)
+            if k > 0
+                for v in vars
+                    f = fields[v.name]
+                    z = get!(arrays, v.name) do
+                        zcreate(Float32, g, v.name, size(f, 1), 0;
+                                chunks = (size(f, 1), chunk_samples), compressor = compressor)
+                    end
+                    old = size(z, 2)
+                    resize!(z, size(z, 1), old + k)
+                    z[:, old+1:old+k] = f[:, mask]
+                end
+            end
+            verbose && @info "  $(label) · appended" kept=k dropped=(nseen - k) keep_fraction=round(k / max(nseen, 1); digits = 3)
+        end
+
+        total_kept > 0 || error("no valid land samples remain after filtering missings")
+        verbose && @info "Preprocessing done" path=zarr_path n_samples=total_kept
+
+        return (; path = zarr_path,
+                  input_names = String[v.name for v in inputs],
+                  target_name = target.name,
+                  n_samples = total_kept,
+                  n_dropped = total_seen - total_kept,
+                  years = isnothing(years) ? nothing : collect(years))
+    finally
+        foreach(close, values(datasets))
     end
-
-    nsamples = size(first(fields), 2)
-    all(f -> size(f, 2) == nsamples, fields) ||
-        error("all variables must share the same lat×lon×time grid (sample count mismatch)")
-
-    # Joint validity mask across every feature of every variable.
-    valid = trues(nsamples)
-    for f in fields
-        valid .&= vec(all(isfinite, f; dims = 1))
-    end
-    nkept = count(valid)
-    nkept > 0 || error("no valid land samples remain after filtering missings")
-    verbose && @info "  filtered missing/ocean samples" kept=nkept dropped=(nsamples - nkept) keep_fraction=round(nkept / nsamples; digits = 3)
-
-    if overwrite && ispath(zarr_path)
-        rm(zarr_path; recursive = true, force = true)
-    end
-
-    g = zgroup(zarr_path; attrs = Dict(
-        "input_names" => String[v.name for v in inputs],
-        "target_name" => target.name,
-        "n_samples"   => nkept,
-    ))
-
-    verbose && @info "  writing $(length(names)) compressed arrays to Zarr"
-    for (i, (name, f)) in enumerate(zip(names, fields))
-        clean = f[:, valid]                              # land-only, NaN-free
-        t = time()
-        z = zcreate(Float32, g, name, size(clean)...;
-                    chunks = (size(clean, 1), min(chunk_samples, nkept)),
-                    compressor = compressor)
-        z[:, :] = clean
-        verbose && @info "  wrote [$i/$(length(names))] $(name)" size=size(clean) seconds=round(time() - t; digits = 2)
-    end
-    verbose && @info "Preprocessing done" path=zarr_path n_samples=nkept
-
-    return (; path = zarr_path,
-              input_names = String[v.name for v in inputs],
-              target_name = target.name,
-              n_samples = nkept,
-              n_dropped = nsamples - nkept)
 end
-
-# This file is a library. To run preprocessing from the command line, use the
-# companion script run_preprocessing.jl, e.g.
-#   julia +1.12 --project=. run_preprocessing.jl path/to/era5_land.nc
