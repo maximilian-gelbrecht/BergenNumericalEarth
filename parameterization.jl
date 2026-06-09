@@ -1,3 +1,10 @@
+# # Defining the learned parameterization 
+#
+# 
+#
+#
+# 
+
 using Adapt, Random
 
 @kwdef struct LearnedSurfaceRoughness{NF, V, M, LNN, LP, LS} <: SpeedyWeather.AbstractSurfaceRoughness
@@ -6,14 +13,14 @@ using Adapt, Random
 
     # learned land roughness parameters
     # Land normalisation parameters (NamedTuples keyed by the inputs used in
-    # surface_roughness_land), built in the outer constructor below
+    # surface_roughness_land) to normalize NN inputs
     land_input_means::M
     land_input_stds::M
 
     land_output_mean::NF = -5.031811f0
     land_output_std::NF = 2.4447718f0
 
-    # input buffer for NN input
+    # input buffer for NN input so that we don't need to allocate it every time
     land_input_buffer::V
 
     # NN structure, parameters and states
@@ -30,6 +37,8 @@ function LearnedSurfaceRoughness(
         kwargs...
     )
 
+    # device handling: this tells Lux that we want the NN on the same device  
+    # as our atmosphere
     lux_device = MLDataDevices.get_device(SG.architecture)
 
     # Set up Lux NN, if it's not provided
@@ -99,6 +108,8 @@ end
 
 Base.@propagate_inbounds function surface_roughness_land(ij, vars, scheme::LearnedSurfaceRoughness)
     
+    # we collect all inputs for the NN from our state variables
+    # this doesn't allocate it's just a shorthand 
     vₕ = vars.parameterizations.land.vegetation_high[ij]
     vₗ =  vars.parameterizations.land.vegetation_low[ij]
     vᵦ = 1 - vₕ - vₗ  # bare soil
@@ -116,9 +127,13 @@ Base.@propagate_inbounds function surface_roughness_land(ij, vars, scheme::Learn
     soil_moisture = normalise(soil_moisture, scheme.land_input_means.soil_moisture, scheme.land_input_stds.soil_moisture)
     soil_temperature = normalise(soil_temperature, scheme.land_input_means.soil_temperature, scheme.land_input_stds.soil_temperature)
 
+    # write into input buffer for NN 
     scheme.land_input_buffer[:] .= (vᵦ, vₕ, vₗ, g, sd, soil_temperature, soil_moisture)
 
+    # apply NN 
     prediction, _ = Lux.apply(scheme.land_nn, scheme.land_input_buffer, scheme.land_params, scheme.land_states)
+    
+    # unnormalise and return 
     log_surface_roughness = (prediction[1] * scheme.land_output_std) + scheme.land_output_mean
     surface_roughness = exp(log_surface_roughness)
     return surface_roughness
