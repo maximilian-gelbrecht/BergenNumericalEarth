@@ -47,7 +47,9 @@ function LearnedSurfaceRoughness(
         land_nn = Lux.Chain(
             Lux.Dense(7 => 32, Lux.leakyrelu),
             Lux.Dense(32 => 64, Lux.leakyrelu),
+            Lux.Dropout(0.2),
             Lux.Dense(64 => 64, Lux.leakyrelu),
+            Lux.Dropout(0.1),
             Lux.Dense(64 => 32, Lux.leakyrelu),
             Lux.Dense(32 => 1)
         )
@@ -115,7 +117,7 @@ Base.@propagate_inbounds function surface_roughness_land(ij, vars, scheme::Learn
     g = vars.grid.geopotential[ij, end]
     sd = vars.prognostic.land.snow_depth[ij]
     soil_moisture = vars.prognostic.land.soil_moisture[ij, begin]  # currently top layer
-    soil_temperature = vars.prognostic.land.soil_temperature[ij, end]  # currently bottom layer
+    soil_temperature = vars.prognostic.land.soil_temperature[ij, begin]  # top layer (matches stl1)
 
     # Normalise inputs
     vₕ = normalise(vₕ, scheme.land_input_means.vegetation_high, scheme.land_input_stds.vegetation_high)
@@ -142,8 +144,9 @@ Base.@propagate_inbounds function SpeedyWeather.surface_roughness!(ij, vars, sch
     land_fraction = land_sea_mask.mask[ij]
 
     # Compute separate ocean and land surface roughness
-    vars.parameterizations.ocean.surface_roughness[ij] = ifelse(land_fraction > 0, scheme.roughness_length_ocean, zero(land_fraction)) 
-    vars.parameterizations.land.surface_roughness[ij] = ifelse(land_fraction < 1, surface_roughness_land(ij, vars, scheme), zero(land_fraction)) 
+    # (ocean roughness where there is any ocean, land roughness where there is any land)
+    vars.parameterizations.ocean.surface_roughness[ij] = ifelse(land_fraction < 1, scheme.roughness_length_ocean, zero(land_fraction))
+    vars.parameterizations.land.surface_roughness[ij] = ifelse(land_fraction > 0, surface_roughness_land(ij, vars, scheme), zero(land_fraction))
 
     # Blend the two via arithmetic average
     vars.parameterizations.surface_roughness[ij] = land_fraction * vars.parameterizations.land.surface_roughness[ij] + (1 - land_fraction) * vars.parameterizations.ocean.surface_roughness[ij]

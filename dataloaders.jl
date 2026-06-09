@@ -25,7 +25,7 @@ function standardize(X::AbstractMatrix, μ::AbstractVector, σ::AbstractVector)
 end
 
 """
-    load_zarr_dataset(zarr_path; normalize=true, target_transform=identity)
+    load_zarr_dataset(zarr_path; normalize=true, target_transform=identity, add_bare_soil=true)
 
 Read the column-wise dataset written by `preprocess_to_zarr`. Stacks the input
 variables (in the stored `input_names` order) into `X :: (features, samples)` and
@@ -36,18 +36,36 @@ Keywords
     e.g. `log` to regress in log space (the parameterization predicts `log`
     surface roughness).
   * `normalize` – standardise inputs and target to zero mean / unit std.
+  * `add_bare_soil` – prepend the bare-soil fraction `1 - cvh - cvl` as the first
+    feature row. This is the 7th input the `LearnedSurfaceRoughness` NN expects (its
+    input order is `[bare_soil, vegetation_high, vegetation_low, geopotential,
+    snow_depth, soil_temperature, soil_moisture]`); it is derived here rather than
+    stored, and "bare_soil" is prepended to the returned `input_names`.
 
 Returns `(; X, Y, input_mean, input_std, target_mean, target_std, input_names, target_name)`.
 The data is already clean (preprocessing dropped every NaN/missing sample).
 """
 function load_zarr_dataset(zarr_path::AbstractString;
-        normalize::Bool = true, target_transform = identity)
+        normalize::Bool = true, target_transform = identity, add_bare_soil::Bool = true)
 
     g = zopen(zarr_path, "r")
     input_names = String.(g.attrs["input_names"])
     target_name = String(g.attrs["target_name"])
 
-    X = reduce(vcat, (Float32.(g[name][:, :]) for name in input_names))
+    # one (features, samples) block per stored input variable
+    feats = Any[Float32.(g[name][:, :]) for name in input_names]
+
+    # bare-soil fraction isn't stored — derive it so X matches the NN's 7-input order
+    if add_bare_soil
+        ih = findfirst(==("cvh"), input_names)   # high vegetation cover
+        il = findfirst(==("cvl"), input_names)   # low vegetation cover
+        (isnothing(ih) || isnothing(il)) &&
+            error("add_bare_soil needs 'cvh' and 'cvl' among inputs; got $(input_names)")
+        pushfirst!(feats, 1f0 .- feats[ih] .- feats[il])
+        input_names = ["bare_soil"; input_names]
+    end
+
+    X = reduce(vcat, feats)
     Y = target_transform.(Float32.(g[target_name][:, :]))
 
     input_mean, input_std   = feature_mean_std(X)
