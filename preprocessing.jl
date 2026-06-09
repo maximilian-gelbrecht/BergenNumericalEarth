@@ -155,7 +155,7 @@ order — the usual case for one file).
 Returns `(; path, input_names, target_name, n_samples, n_dropped, years)`.
 """
 function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFVar,
-        zarr_path::AbstractString; years = nothing, time_name::AbstractString = "time",
+        zarr_path::AbstractString; years = nothing, time_name::AbstractString = "valid_time",
         chunk_samples::Int = 8192, overwrite::Bool = true,
         compressor = Zarr.BloscCompressor(cname = "zstd", clevel = 5, shuffle = 1),
         verbose::Bool = true)
