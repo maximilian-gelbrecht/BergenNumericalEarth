@@ -112,7 +112,7 @@ Base.@propagate_inbounds function surface_roughness_land(ij, vars, scheme::Learn
     # this doesn't allocate it's just a shorthand 
     vₕ = vars.parameterizations.land.vegetation_high[ij]
     vₗ =  vars.parameterizations.land.vegetation_low[ij]
-    vᵦ = 1 - vₕ - vₗ  # bare soil
+    vᵦ = 1 - vₕ - vₗ  # bare soil fraction
     g = vars.grid.geopotential[ij, end]
     sd = vars.prognostic.land.snow_depth[ij]
     soil_moisture = vars.prognostic.land.soil_moisture[ij, begin]  # currently top layer
