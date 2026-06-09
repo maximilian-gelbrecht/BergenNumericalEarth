@@ -37,18 +37,17 @@ function LearnedSurfaceRoughness(
         kwargs...
     )
 
-    # device handling: this tells Lux that we want the NN on the same device  
-    # as our atmosphere
-    lux_device = MLDataDevices.get_device(SG.architecture)
+    # device handling: pick the Lux device matching our atmosphere's architecture so
+    # the NN lives on the same device. (`get_device` queries an array's device; here we
+    # need to *select* one from the SpeedyWeather architecture.)
+    lux_device = SG.architecture isa GPU ? MLDataDevices.gpu_device() : MLDataDevices.cpu_device()
 
     # Set up Lux NN, if it's not provided
     if isnothing(land_nn) 
         land_nn = Lux.Chain(
             Lux.Dense(7 => 32, Lux.leakyrelu),
             Lux.Dense(32 => 64, Lux.leakyrelu),
-            Lux.Dropout(0.2),
             Lux.Dense(64 => 64, Lux.leakyrelu),
-            Lux.Dropout(0.1),
             Lux.Dense(64 => 32, Lux.leakyrelu),
             Lux.Dense(32 => 1)
         )
