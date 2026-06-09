@@ -1,13 +1,13 @@
 # Preprocessing: global NetCDF fields -> column-wise Zarr store prepared for dataloaders
 #
 #   1. Read the requested variables from one big multi-year NetCDF file, loading only
-#      a single year's time-slice into RAM at a time. We work with land variables,
-#      several of which carry missing values over the ocean.
+#      a single year's time-slice into RAM at a time.
 #   2. Flatten every field column-wise: each grid point (at each time step) becomes
 #      one sample / column.
-#   3. Drop every sample that is NaN/missing in ANY input or the target, so that
-#      the Zarr — and therefore the dataloaders — never see an invalid value.
-#   4. Append each year's filtered, land-only columns to a per-variable Zarr array.
+#   3. Optionally restrict to land via a static land-sea mask (ERA5 `lsm`) — the ocean
+#      here is filled with values, not left missing, so it must be masked explicitly.
+#   4. Append each chunk's selected columns to a per-variable Zarr array, asserting
+#      they hold no NaN/missing rather than silently filtering invalid samples.
 
 using NCDatasets, Zarr, Dates
 
@@ -71,6 +71,26 @@ function load_var_slice(ds, name::AbstractString, tidx; level = nothing)
 end
 
 """
+    load_landmask(v::NetCDFVar, threshold) -> Vector{Bool}
+
+Read a static land-sea mask field (e.g. ERA5 `lsm`, a 0–1 land fraction on the same
+grid) and return a boolean vector flattened in the same column-major order as
+`flatten_pointwise` (first spatial dim fastest), `true` where the field is
+`≥ threshold` (land). A trailing time dimension, if present, is reduced to its first
+slice — a land-sea mask is static.
+"""
+function load_landmask(v::NetCDFVar, threshold::Real)
+    a = NCDataset(v.path) do ds
+        haskey(ds, v.name) || error("land mask variable '$(v.name)' not found in $(v.path)")
+        var = ds[v.name]
+        ndims(var) == 2 ? var[:, :] :
+        ndims(var) == 3 ? var[:, :, 1] :
+        error("expected a 2D (lon,lat) or 3D (lon,lat,time) land mask '$(v.name)', got $(ndims(var))D")
+    end
+    return vec(to_float32_nan(a)) .>= Float32(threshold)
+end
+
+"""
     subsample_time(idx, stride) -> indices
 
 Keep every `stride`-th time index (`stride ≤ 1` keeps all). Works on both ranges
@@ -129,8 +149,8 @@ end
 
 """
     preprocess_to_zarr(inputs, target, zarr_path; years=nothing, time_name="valid_time",
-                       time_stride=1, chunk_samples=2^22, overwrite=true,
-                       compressor=..., verbose=true)
+                       time_stride=1, chunk_samples=2^22, landmask=nothing,
+                       landmask_threshold=0.5, overwrite=true, compressor=..., verbose=true)
 
 Build the column-wise dataset from a big multi-year NetCDF file and persist it as a
 Zarr group, loading only one year's time-slice into RAM at a time.
@@ -145,21 +165,30 @@ Memory model
     CF-decoded `time_name` coordinate is used to find each year's time indices, and
     every variable is read sliced to those indices — so only one year of data is in
     memory at once. With `years=nothing` the whole file is processed in one go.
-  * Each year is handled independently in a single pass: load all variables for the
-    year, drop every sample that is missing in ANY of them (the join across
-    variables), then append the surviving land-only columns to each variable's Zarr
-    array. Masks may differ year to year — that is fine, since samples are stored
-    column-wise.
+  * Each year is handled independently in a single pass: load all variables, select
+    the land columns (via `landmask`, or all columns if none is given), and append
+    them to each variable's Zarr array. Selected columns are asserted to be free of
+    NaN/missing before writing — invalid values raise an error rather than being
+    silently dropped. Different chunks may contribute different numbers of columns,
+    which is fine since samples are stored column-wise.
   * `time_stride` thins the time axis before flattening (keep every `stride`-th
     step; `1` keeps all). The surface fields here are highly redundant in time
     (orography/geopotential is constant, vegetation cover is near-constant, surface
     roughness is quasi-static), so a large stride cuts the sample count — and hence
     the on-disk chunk count — by that factor with little loss. For 3-hourly data:
     `8`≈daily, `56`≈weekly, `240`≈monthly.
+  * `landmask` optionally restricts the output to land. This file's variables are
+    *filled* (not missing) over the ocean — soil temperature carries SST, vegetation
+    and soil moisture are 0, etc. — so the NaN filter alone never drops sea points,
+    and no in-file variable cleanly separates land from sea (e.g. deserts look like
+    ocean in vegetation/soil moisture). Pass a `NetCDFVar` pointing at a static
+    land-sea mask on the same grid (e.g. ERA5 `lsm`, a 0–1 land fraction); columns
+    with mask `< landmask_threshold` (default `0.5`) are dropped. The mask is loaded
+    once and reused for every timestep.
 
 `chunk_samples` is the chunk width along the sample axis; the Zarr directory store
 writes one file per chunk, so the file count is roughly
-`(total_samples / chunk_samples) × n_variables`. Keep it large (default `2^20`) and
+`(total_samples / chunk_samples) × n_variables`. Keep it large (default `2^22`) and
 use `time_stride` to keep `total_samples` modest, or the store explodes into
 millions of tiny files. The default `2^22` (~16 MiB chunks) keeps this file at a
 few thousand chunk files for typical strides.
@@ -180,7 +209,9 @@ Returns `(; path, input_names, target_name, n_samples, n_dropped, years)`.
 """
 function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFVar,
         zarr_path::AbstractString; years = nothing, time_name::AbstractString = "valid_time",
-        time_stride::Int = 55, chunk_samples::Int = 1 << 22, overwrite::Bool = true,
+        time_stride::Int = 61, chunk_samples::Int = 1 << 22,
+        landmask::Union{Nothing, NetCDFVar} = nothing, landmask_threshold::Real = 0.5,
+        overwrite::Bool = true,
         compressor = Zarr.BloscCompressor(cname = "zstd", clevel = 5, shuffle = 1),
         verbose::Bool = true)
 
@@ -215,6 +246,13 @@ function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFV
         ))
         arrays = Dict{String, Any}()
 
+        # optional static land-sea mask: a per-grid-point boolean reused every timestep.
+        # This file's variables are filled (not missing) over ocean, so this mask — not
+        # a NaN filter — is what restricts the output to land.
+        landvec = isnothing(landmask) ? nothing : load_landmask(landmask, landmask_threshold)
+        verbose && !isnothing(landvec) &&
+            @info "  land-sea mask" land_points=count(landvec) grid_points=length(landvec) threshold=landmask_threshold
+
         total_kept = total_seen = 0
         for (label, idxmap) in chunks
             # skip a requested year that is absent from any file
@@ -223,47 +261,49 @@ function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFV
                 continue
             end
 
-            # load every variable for this year and build the joint land mask
+            # load and column-flatten every variable for this chunk
             fields = Dict{String, Any}()
-            mask = nothing
             for v in vars
                 t = time()
-                f = flatten_pointwise(load_var_slice(datasets[v.path], v.name, idxmap[v.path]; level = v.level))
-                fields[v.name] = f
-                m = vec(all(isfinite, f; dims = 1))
-                if isnothing(mask)
-                    mask = m
-                else
-                    length(m) == length(mask) ||
-                        error("sample-count mismatch in year $(label) for '$(v.name)': $(length(m)) vs $(length(mask))")
-                    mask .&= m
-                end
-                verbose && @info "  $(label) · loaded $(v.name)" features=size(f, 1) samples=size(f, 2) seconds=round(time() - t; digits = 2)
+                fields[v.name] = flatten_pointwise(load_var_slice(datasets[v.path], v.name, idxmap[v.path]; level = v.level))
+                verbose && @info "  $(label) · loaded $(v.name)" features=size(fields[v.name], 1) samples=size(fields[v.name], 2) seconds=round(time() - t; digits = 2)
             end
 
-            nseen = length(mask)
-            k = count(mask)
+            # column selector: the land points (tiled across this chunk's timesteps,
+            # since samples run space-fastest then time), or all columns if no mask.
+            nseen = size(fields[vars[1].name], 2)
+            cols = if isnothing(landvec)
+                Colon()
+            else
+                nsp = length(landvec)
+                nseen % nsp == 0 ||
+                    error("land mask has $(nsp) points but year $(label) has $(nseen) samples; grid mismatch?")
+                repeat(landvec, nseen ÷ nsp)
+            end
+            k = cols isa Colon ? nseen : count(cols)
             total_seen += nseen
             total_kept += k
 
-            # append this year's land-only, NaN-free columns to each variable's array
-            # (created lazily on first write, with its feature-row count from the slice)
+            # append the selected columns; assert they are clean rather than filtering.
             if k > 0
                 for v in vars
-                    f = fields[v.name]
+                    f = fields[v.name][:, cols]
+                    nbad = count(isnan, f)
+                    nbad == 0 ||
+                        error("year $(label): '$(v.name)' has $(nbad) NaN/missing value(s) among the $(k) kept samples")
                     z = get!(arrays, v.name) do
                         zcreate(Float32, g, v.name, size(f, 1), 0;
                                 chunks = (size(f, 1), chunk_samples), compressor = compressor)
                     end
                     old = size(z, 2)
                     resize!(z, size(z, 1), old + k)
-                    z[:, old+1:old+k] = f[:, mask]
+                    z[:, old+1:old+k] = f
                 end
             end
-            verbose && @info "  $(label) · appended" kept=k dropped=(nseen - k) keep_fraction=round(k / max(nseen, 1); digits = 3)
+            verbose && @info "  $(label) · appended" kept=k of=nseen
         end
 
-        total_kept > 0 || error("no valid land samples remain after filtering missings")
+        total_kept > 0 || error("no samples to write (empty after applying the land mask?)")
         verbose && @info "Preprocessing done" path=zarr_path n_samples=total_kept
 
         return (; path = zarr_path,
