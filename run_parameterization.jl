@@ -84,4 +84,4 @@ extrema(simulation.variables.parameterizations.land.surface_roughness)
 # `land_input_buffer` (a data race in a parallel kernel) and `Lux.apply` of a
 # full `Chain` cannot be called from inside a GPU kernel. For the GPU we would
 # instead evaluate the network batched over all grid points at once, as a global
-# parameterization — that's the next step after this workshop.
+# parameterization — that's the next (optional step).
