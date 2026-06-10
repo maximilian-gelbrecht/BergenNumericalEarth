@@ -77,7 +77,25 @@ function LearnedSurfaceRoughnessGlobal(
         input_buffer, land_nn, land_params, land_states, kwargs...)
 end
 
-Adapt.@adapt_structure LearnedSurfaceRoughnessGlobal
+# One GPU subtlety: SpeedyWeather fuses all *column* parameterizations into a
+# single GPU kernel and passes the (adapted) model components into it — and
+# kernel arguments must be `isbits`. A Lux network is not (its Dropout states
+# carry a mutable RNG). But the column kernel never evaluates our network — it
+# only runs in the host-side global pass. So when the scheme is adapted for the
+# kernel we simply strip the network, keeping the lightweight rest:
+
+function Adapt.adapt_structure(to, scheme::LearnedSurfaceRoughnessGlobal)
+    land_input_mean = Adapt.adapt(to, scheme.land_input_mean)
+    land_input_std  = Adapt.adapt(to, scheme.land_input_std)
+    input_buffer    = Adapt.adapt(to, scheme.input_buffer)
+    return LearnedSurfaceRoughnessGlobal{
+        typeof(scheme.land_output_mean), typeof(land_input_mean),
+        typeof(input_buffer), Nothing, Nothing, Nothing}(
+        scheme.roughness_length_ocean, land_input_mean, land_input_std,
+        scheme.land_output_mean, scheme.land_output_std, input_buffer,
+        nothing, nothing, nothing)
+end
+
 SpeedyWeather.initialize!(::LearnedSurfaceRoughnessGlobal, ::PrimitiveEquation) = nothing
 
 # ## The global `parameterization!`
@@ -118,7 +136,10 @@ function SpeedyWeather.parameterization!(vars::SpeedyWeather.Variables,
     z₀_ocean = vars.parameterizations.ocean.surface_roughness
     z₀ = scheme.roughness_length_ocean
 
-    z₀_land .= ifelse.(mask .> 0,
+    ## mixing Fields and plain GPU arrays in one broadcast falls back to (slow,
+    ## disallowed) scalar indexing — broadcast over the underlying arrays
+    ## (`parent`) wherever the raw NN output `pred` is involved
+    parent(z₀_land) .= ifelse.(parent(mask) .> 0,
         exp.(vec(pred) .* scheme.land_output_std .+ scheme.land_output_mean),
         zero(z₀))
     z₀_ocean .= ifelse.(mask .< 1, z₀, zero(z₀))
