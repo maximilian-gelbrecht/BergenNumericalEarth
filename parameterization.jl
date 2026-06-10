@@ -1,9 +1,26 @@
 # # Defining the learned parameterization 
 #
+# Here, we define the learned surface roughness parameteriztion for usage with SpeedyWeather.jl  
+# In SpeedyWeather we have two different kinds of possible custom parameterizations, the typical  
+# column-based parameterizations that only compute per column, and global parameterizations that 
+# take the complete global field as an input. An example for a global parameterization in our model 
+# is the solar zenith calculation. The surface roughness we will implement as a column-based 
+# parameterization initially. The parameterization system is explained in detail in the [documentation](https://speedyweather.github.io/SpeedyWeatherDocumentation/dev/parameterizations#Define-your-own-parameterizations).
 # 
-#
-#
+# In case of defining a new surface roughness, we just need to replace the default one
+# `ConstantSurfaceRoughness` that merely writes constant values into the allocated variables 
+# * `vars.parameterizations.ocean.surface_roughness`,
+# * `vars.parameterizations.land.surface_roughness`,
+# * `vars.parameterizations.surface_roughness`.
 # 
+# Therefore, we don't need to worry about the tendency or flux computation with this parameterization.
+# We just need implement 
+# * A `struct` that holds the parameters (including the NN) 
+# * A constructor for that `struct`
+# * `SpeedyWeather.initialize!(::LearnedSurfaceRoughness, ::PrimitiveEquation)` that initializes the parameterization
+# * Either a `SpeedyWeather.parameterization!(ij, vars, scheme::AbstractSurfaceRoughness, model)` or `SpeedyWeather.surface_roughness!(ij, vars, scheme::LearnedSurfaceRoughness, land_sea_mask)` that implements the actual computation
+#
+# Okay, let's go! First we define the `struct` and it's constructor:
 
 using Adapt, Random
 
@@ -31,55 +48,16 @@ end
 
 function LearnedSurfaceRoughness(
         SG::SpectralGrid,
-        land_nn = nothing, 
-        land_params = nothing, 
-        land_states = nothing;
+        land_nn, 
+        land_params, 
+        land_states, 
+        land_input_means, 
+        land_input_stds;
         kwargs...
     )
 
-    # device handling: pick the Lux device matching our atmosphere's architecture so
-    # the NN lives on the same device. (`get_device` queries an array's device; here we
-    # need to *select* one from the SpeedyWeather architecture.)
-    lux_device = SG.architecture isa GPU ? MLDataDevices.gpu_device() : MLDataDevices.cpu_device()
-
-    # Set up Lux NN, if it's not provided
-    if isnothing(land_nn) 
-        land_nn = Lux.Chain(
-            Lux.Dense(7 => 32, Lux.leakyrelu),
-            Lux.Dense(32 => 64, Lux.leakyrelu),
-            Lux.Dropout(0.2),
-            Lux.Dense(64 => 64, Lux.leakyrelu),
-            Lux.Dropout(0.1),
-            Lux.Dense(64 => 32, Lux.leakyrelu),
-            Lux.Dense(32 => 1)
-        )
-
-        rng = Random.default_rng()
-        land_params, rand_states = Lux.setup(rng, land_nn) |> lux_device
-        land_states = Lux.testmode(rand_states)
-    end
-
+    # we allocate the input buffer on the same device we are running the model on
     land_input_buffer = on_architecture(SG.architecture, zeros(Float32, 7))
-
-    # Land normalisation parameters, keyed by the inputs used in surface_roughness_land
-    land_input_means = (
-        bare_soil        = 7.4566591f-1,
-        vegetation_high  = 1.0025085f-1,
-        vegetation_low   = 1.5397815f-1,
-        geopotential     = 1.6788273f+4,
-        snow_depth       = 6.3441253f+0,
-        soil_temperature = 2.5690454f+2,
-        soil_moisture    = 2.1826939f-1,
-    )
-    land_input_stds = (
-        bare_soil        = 4.23785776f-1,
-        vegetation_high  = 2.76675612f-1,
-        vegetation_low   = 3.28937173f-1,
-        geopotential     = 1.16441348f+4,
-        snow_depth       = 4.8089776f+0,
-        soil_temperature = 3.01283646f+1,
-        soil_moisture    = 1.26479045f-1,
-    )
 
     return LearnedSurfaceRoughness{
         SG.NF,
@@ -99,9 +77,17 @@ function LearnedSurfaceRoughness(
     )
 end
 
+## this is some housekeeping we need for GPU compatability 
 Adapt.@adapt_structure LearnedSurfaceRoughness
 
+# Next, the `initialize!` in this case it's actually, completley trivial: we 
+# can just do `nothing`. 
+
 SpeedyWeather.initialize!(::LearnedSurfaceRoughness, ::PrimitiveEquation) =  nothing
+
+# Now, the core computation that collects the input variables, normalizes them, 
+# applies the neural network and then writes this into # * `vars.parameterizations.ocean.surface_roughness`,
+# `vars.parameterizations.land.surface_roughness`, and `vars.parameterizations.surface_roughness`.
 
 @inline function normalise(a, m, s)
     return (a - m) / s
