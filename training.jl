@@ -1,19 +1,56 @@
-# Training a column-wise Lux model with `Lux.Training`.
+# # Offline training of the learned surface roughness
 #
-# Pairs with dataloaders.jl. The DataLoaders there yield `(x, y)` batches with
-#     x :: (features, batch)
-#     y :: (1, batch)
-#
-# The training loop is the standard Lux.Training pattern:
-#   1. `TrainState(model, ps, st, optimizer)` bundles params, states and optimiser.
-#   2. `single_train_step!(ad, lossfn, (x, y), state)` does fwd + backward + update.
-#   3. evaluate on a validation loader with the states put in test mode.
+# Now, that we have code for the dataloaders, we can train the column-wise MLP of 
+# `LearnedSurfaceRoughness`. We first actually load the data, then we set up the model
+# and train it offline. 
 
-using Lux, Optimisers, Zygote, ADTypes, Random, Printf, JLD2
+import Pkg
+Pkg.activate(".")
+
+using Lux, Optimisers, Zygote, ADTypes, Random, Printf, JLD2, CUDA, cuDNN
 using MLDataDevices: cpu_device, gpu_device
 using Lux: Training
 
 include("dataloaders.jl")
+
+# ## Data configuration 
+# 
+# Here, we set everything needed for our dataloaders and some general configuration
+
+zarr_path  = "/p/projects/ou/labs/ai/max/era5-roughness.zarr"  # preprocessed store
+batchsize  = 2048
+split      = 0.9        # fraction of samples used for training
+seed       = 0          # RNG seed for reproducible init & shuffles
+use_gpu    = true       # true -> train on the GPU
+device = use_gpu ? gpu_device(; force = true) : cpu_device()
+rng = Random.Xoshiro(seed)
+
+# Then, actually load the data 
+
+train_loader, val_loader, stats =
+    pointwise_dataloaders(zarr_path; batchsize, split, target_transform = log, rng)
+
+# ## Model 
+#
+# Now, we construct our model, a standard MLP. 
+
+model = Lux.Chain(
+    Lux.Dense(7 => 32, Lux.leakyrelu),
+    Lux.Dense(32 => 64, Lux.leakyrelu),
+    Lux.Dropout(0.2),
+    Lux.Dense(64 => 64, Lux.leakyrelu),
+    Lux.Dropout(0.1),
+    Lux.Dense(64 => 32, Lux.leakyrelu),
+    Lux.Dense(32 => 1),
+)
+
+# ## Training
+# 
+# First, we define our training loop. The loop includes an early stopping based 
+# on the error on the validation set and a basic monitoring of the loss on the 
+# training and validation set that is saved to CSV file for later plotting. 
+#
+# We also define a few utilities for loading and saving the model. 
 
 """
     train_model(model, train_loader, val_loader=nothing; kwargs...)
@@ -34,6 +71,11 @@ Keywords
                          only when a `val_loader` is given and `patience > 0`.
   * `min_delta`        – minimum decrease in validation loss that counts as an
                          improvement.
+  * `history_path`     – if given, the per-epoch train/validation losses are
+                         appended to this CSV file (columns `epoch,train,val`)
+                         and flushed every epoch. Robust to crashes/early
+                         stopping and ready to `tail -f` or plot *during*
+                         training. `nothing` (default) disables the CSV.
   * `rng`, `verbose`.
 
 Returns `(; train_state, ps, st, history, best_epoch, best_val)` where `ps`/`st`
@@ -45,6 +87,7 @@ losses.
 function train_model(model, train_loader, val_loader = nothing;
         epochs::Int = 50, learning_rate = 1.0f-3, lossfn = MSELoss(), ad = AutoZygote(),
         device = cpu_device(), patience::Int = 10, min_delta::Real = 0,
+        history_path::Union{Nothing, AbstractString} = nothing,
         rng::AbstractRNG = Random.default_rng(), verbose = true)
 
     ps, st = device(Lux.setup(rng, model))
@@ -56,6 +99,15 @@ function train_model(model, train_loader, val_loader = nothing;
     best_val, best_epoch, stale = Inf, 0, 0               # early-stopping bookkeeping
     best_ps = best_st = nothing                           # snapshot of best weights
 
+    # per-epoch CSV log of the losses, flushed every epoch so it survives a crash
+    # or early stop and can be plotted / `tail -f`'d while training is still running
+    io = isnothing(history_path) ? nothing : open(history_path, "w")
+    if !isnothing(io)
+        println(io, "epoch,train,val")
+        flush(io)
+    end
+
+    try
     for epoch in 1:epochs
         # --- one pass over the training data ---
         running, nbatches = 0.0, 0
@@ -76,6 +128,12 @@ function train_model(model, train_loader, val_loader = nothing;
 
         verbose && @printf("epoch %4d   train %.5f   val %.5f\n", epoch, train_loss, val_loss)
 
+        # --- persist the losses for later plotting ---
+        if !isnothing(io)
+            @printf(io, "%d,%.8f,%.8f\n", epoch, train_loss, val_loss)
+            flush(io)
+        end
+
         # --- early stopping: track the best epoch and stop when patience runs out ---
         if early_stop
             if val_loss < best_val - min_delta
@@ -90,6 +148,9 @@ function train_model(model, train_loader, val_loader = nothing;
                 break
             end
         end
+    end
+    finally
+        isnothing(io) || close(io)
     end
 
     # restore the best-validation weights when early stopping was active
@@ -120,57 +181,58 @@ function evaluate(model, ps, st, loader; lossfn = MSELoss(), device = cpu_device
     return running / max(nbatches, 1)
 end
 
-# ----------------------------------------------------------------------------
-# Saving / loading the trained model
-# ----------------------------------------------------------------------------
-
 """
-    save_model(path, model, ps, st; stats=nothing)
+    save_model(path, model, ps, st; stats=nothing, history=nothing)
 
 Save a trained model to `path` (a `.jld2` file) with JLD2. Parameters and states
 are moved to the CPU first so the file is portable across CPU/GPU runs. Pass the
 dataloader `stats` (input/target mean & std) to bundle the normalisation
-constants needed at inference. Returns `path`.
+constants needed at inference, and the `history` returned by [`train_model`](@ref)
+to keep the per-epoch train/validation loss curves alongside the weights for
+later plotting. Returns `path`.
 """
-function save_model(path::AbstractString, model, ps, st; stats = nothing)
+function save_model(path::AbstractString, model, ps, st; stats = nothing, history = nothing)
     cdev = cpu_device()
-    jldsave(path; model, parameters = cdev(ps), states = cdev(st), stats)
+    jldsave(path; model, parameters = cdev(ps), states = cdev(st), stats, history)
     return path
 end
 
 """
-    load_model(path) -> (; model, parameters, states, stats)
+    load_model(path) -> (; model, parameters, states, stats, history)
 
 Load a model saved with [`save_model`](@ref). The same packages used to build the
-model (e.g. Lux) must be loaded for deserialisation to succeed.
+model (e.g. Lux) must be loaded for deserialisation to succeed. `history` is the
+train/validation loss record (or `nothing` for models saved without it).
 """
 function load_model(path::AbstractString)
     data = JLD2.load(path)
     return (; model = data["model"],
               parameters = data["parameters"],
               states = data["states"],
-              stats = data["stats"])
+              stats = data["stats"],
+              history = get(data, "history", nothing))
 end
 
-# ----------------------------------------------------------------------------
-# Example usage (end to end with dataloaders.jl)
-# ----------------------------------------------------------------------------
-#
-#   # 1. preprocess NetCDF -> Zarr once (see preprocessing.jl):
-#   #    preprocess_to_zarr(inputs, target, "surface_roughness.zarr")
-#   #
-#   # 2. build dataloaders from the Zarr store:
-#   train_loader, val_loader, stats =
-#       pointwise_dataloaders("surface_roughness.zarr"; batchsize = 2048, target_transform = log)
-#
-#   # hand over your own model (e.g. the Chain from LearnedSurfaceRoughness);
-#   # its input width must match size(first(train_loader)[1], 1).
-#   model  = Chain(Dense(7 => 32, leakyrelu), Dense(32 => 1))
-#   result = train_model(model, train_loader, val_loader;
-#                        epochs = 200, learning_rate = 1.0f-3, patience = 15)
-#
-#   # result.ps / result.st are the best-validation parameters & test-mode states.
-#   # Bundle them with `stats` (input/target mean & std) — everything the
-#   # LearnedSurfaceRoughness scheme needs at inference — and save:
-#   save_model("surface_roughness_model.jld2", model, result.ps, result.st; stats)
-#   saved = load_model("surface_roughness_model.jld2")
+# ## Now actually train it! 
+# 
+# Now, we actually train our model, save it and plot the training log. 
+
+result = train_model(model, train_loader, val_loader;
+    epochs, learning_rate, patience, device, history_path = csv_path, rng)
+
+@info "training finished" best_epoch = result.best_epoch best_val = result.best_val
+
+# and a  plot of the loss curve: 
+
+using CairoMakie
+
+fig = Figure()
+ax = Axis(fig[1, 1]; xlabel = "epoch", ylabel = "loss", yscale = log10, title = "training loss")
+lines!(ax, result.history.train; label = "train")
+any(!isnan, result.history.val) && lines!(ax, result.history.val; label = "val")
+axislegend(ax)
+save(plot_path, fig)
+
+# As you see 
+# 
+# Next, we'll integrate it in SpeedyWeather.jl and see if it works there as well! 

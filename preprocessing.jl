@@ -71,7 +71,7 @@ function load_var_slice(ds, name::AbstractString, tidx; level = nothing)
 end
 
 """
-    load_landmask(v::NetCDFVar, threshold) -> Vector{Bool}
+    load_landseamask(v::NetCDFVar, threshold) -> Vector{Bool}
 
 Read a static land-sea mask field (e.g. ERA5 `lsm`, a 0–1 land fraction on the same
 grid) and return a boolean vector flattened in the same column-major order as
@@ -79,7 +79,7 @@ grid) and return a boolean vector flattened in the same column-major order as
 `≥ threshold` (land). A trailing time dimension, if present, is reduced to its first
 slice — a land-sea mask is static.
 """
-function load_landmask(v::NetCDFVar, threshold::Real)
+function load_landseamask(v::NetCDFVar, threshold::Real)
     a = NCDataset(v.path) do ds
         haskey(ds, v.name) || error("land mask variable '$(v.name)' not found in $(v.path)")
         var = ds[v.name]
@@ -249,7 +249,7 @@ function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFV
         # optional static land-sea mask: a per-grid-point boolean reused every timestep.
         # This file's variables are filled (not missing) over ocean, so this mask — not
         # a NaN filter — is what restricts the output to land.
-        landvec = isnothing(landmask) ? nothing : load_landmask(landmask, landmask_threshold)
+        landvec = isnothing(landmask) ? nothing : load_landseamask(landmask, landmask_threshold)
         verbose && !isnothing(landvec) &&
             @info "  land-sea mask" land_points=count(landvec) grid_points=length(landvec) threshold=landmask_threshold
 

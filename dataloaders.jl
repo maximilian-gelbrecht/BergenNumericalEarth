@@ -1,14 +1,74 @@
-# Column-wise dataloaders for training Lux.jl models.
+# # Dataloaders
 #
-# Here we only assemble those arrays into model-ready batches:
-#   * vertically stack the input variables into a feature matrix X,
-#   * read the target into Y,
-#   * (optionally) standardise, then split and wrap in `MLUtils.DataLoader`.
+# First, we need to build dataloaders with  model-ready batches for training 
+# our neural network parameterization. The land surface roughness parameterization
+# runs column-wise or point-wise, so we take our seven input surface variables and
+# output just a single scalar surface roughness value in that particular column. 
+# Therefore the dataloaders should provide, for every land column ``i``, a pair
+# ``\big(\mathbf{x}^{(i)},\, y^{(i)}\big)`` of the seven (standardised) input
+# features and the single (log-transformed, standardised) target:
 #
-# Every batch comes out as `x :: (features, batch)`, `y :: (targets, batch)` —
-# the trailing dimension is the batch axis Lux expects.
+# ```math
+# \mathbf{x}^{(i)} = \big(\mathbf{u}^{(i)} - \boldsymbol{\mu}\big) \oslash \boldsymbol{\sigma}
+#   \;\in\; \mathbb{R}^{7},
+# \qquad
+# y^{(i)} = \frac{\log z_0^{(i)} - \mu_y}{\sigma_y} \;\in\; \mathbb{R},
+# ```
+#
+# where ``\oslash`` denotes element-wise division, ``\boldsymbol{\mu}, \boldsymbol{\sigma}``
+# (and ``\mu_y, \sigma_y``) are the per-feature mean and standard deviation over all
+# samples, and the raw feature vector ``\mathbf{u}`` collects the seven surface
+# variables, with the bare-soil fraction ``c_b`` derived rather than stored:
+#
+# ```math
+# \mathbf{u} = \big(\, \underbrace{1 - c_h - c_l}_{c_b},\; c_h,\; c_l,\; \Phi,\; d,\; T,\; \theta \,\big)^\top .
+# ```
+#
+# | symbol     | ERA5    | variable                     |
+# |:----------:|:-------:|:-----------------------------|
+# | ``c_b``    | derived | bare-soil fraction           |
+# | ``c_h``    | `cvh`   | high-vegetation cover        |
+# | ``c_l``    | `cvl`   | low-vegetation cover         |
+# | ``\Phi``   | `z`     | surface geopotential         |
+# | ``d``      | `sd`    | snow depth                   |
+# | ``T``      | `stl1`  | top-layer soil temperature   |
+# | ``\theta`` | `swvl1` | top-layer soil moisture      |
+# | ``z_0``    | `fsr`   | surface roughness *(target)* |
+#
+# Stacking ``B`` columns gives each batch ``X \in \mathbb{R}^{7\times B}`` and
+# ``Y \in \mathbb{R}^{1\times B}`` — the trailing dimension is the batch axis Lux expects.
+
+# ## Pre-processing 
+#
+# We take in ERA5 data for all variables from 2022-2025 at its native resolution at 
+# a roughly weekly temporal resolution (with an included drift to sample all hours 
+# of the day). The pre-processing from the spatiatemporal fields was already done in 
+# `run_preprocessing.jl` and `preprocessing.jl` that you can find in the repository. 
+#
+# For the preprocessing, we 
+# * Merged the downloaded 3-hourly ERA5 data 
+# * Subsampled it roughly weekly resolution 
+# * Applied a land sea mask to only load the land data 
+# * Filtered out any other missing or NaN data 
+# * Saved the data directly in point-wise in a Zarr file 
+#
+# This combined and pre-processed data is avaliable at 
+
+# ## Preparing the dataloaders 
+#
+# With this pre-processing already done, we are left with just some very basic 
+# dataloaders for this. For the dataloaders we use `MLUtils.DataLoader` that 
+# provide us with features e.g. for shuffling the data or also for distributed 
+# computing. 
 
 using Zarr, MLUtils, Random
+
+# ### Standardisation helpers
+#
+# First, some utilities to standardize the data to zero mean / unit variance 
+# as needed in NN input. We'll also save those means and variances later, to 
+# use them to normalize and de-normalize the data on the fly when using it the
+# parameterization in our model. 
 
 "Per-feature (per-row) mean and standard deviation across all samples."
 function feature_mean_std(X::AbstractMatrix)
@@ -23,6 +83,15 @@ function standardize(X::AbstractMatrix, μ::AbstractVector, σ::AbstractVector)
     σsafe = map(s -> iszero(s) ? one(s) : s, σ)
     return (X .- μ) ./ σsafe
 end
+
+# ### Loading the Zarr dataset
+#
+# `load_zarr_dataset` reads the whole Zarr store into memory as `Float32` arrays —
+# the column-wise samples are small (a handful of features each), so even tens
+# of millions of land points fit comfortably. 
+# The feature order matches the 7 inputs the `LearnedSurfaceRoughness` network
+# expects. The target can be transformed (e.g. `log`) before standardisation to
+# regress in the space the parameterization predicts in.
 
 """
     load_zarr_dataset(zarr_path; normalize=true, target_transform=identity, add_bare_soil=true)
@@ -52,10 +121,10 @@ function load_zarr_dataset(zarr_path::AbstractString;
     input_names = String.(g.attrs["input_names"])
     target_name = String(g.attrs["target_name"])
 
-    # one (features, samples) block per stored input variable
-    feats = Any[Float32.(g[name][:, :]) for name in input_names]
+    ## one (features, samples) block per stored input variable
+    feats = Matrix{Float32}[Float32.(g[name][:, :]) for name in input_names]
 
-    # bare-soil fraction isn't stored — derive it so X matches the NN's 7-input order
+    ## bare-soil fraction isn't stored — derive it so X matches the NN's 7-input order
     if add_bare_soil
         ih = findfirst(==("cvh"), input_names)   # high vegetation cover
         il = findfirst(==("cvl"), input_names)   # low vegetation cover
@@ -78,6 +147,13 @@ function load_zarr_dataset(zarr_path::AbstractString;
 
     return (; X, Y, input_mean, input_std, target_mean, target_std, input_names, target_name)
 end
+
+# ## Train/validation loaders
+#
+# Then we code up the actual code to construct the data loaders.
+# Given, the loaded data from the Zarr store by `load_zarr_store` we initialize 
+# the `MLUtils.DataLoader`s with a train and validation split. That we can iterate
+# over during traning. 
 
 """
     pointwise_dataloaders(zarr_path; batchsize=1024, split=0.8, shuffle=true,
@@ -111,13 +187,4 @@ function pointwise_dataloaders(zarr_path::AbstractString;
     return train_loader, val_loader, stats
 end
 
-# ----------------------------------------------------------------------------
-# Example usage (after running preprocess_to_zarr from preprocessing.jl)
-# ----------------------------------------------------------------------------
-#
-#   train_loader, val_loader, stats =
-#       pointwise_dataloaders("surface_roughness.zarr"; batchsize = 2048, target_transform = log)
-#
-#   for (x, y) in train_loader
-#       # x :: (features, batchsize), y :: (1, batchsize)  -> feed straight into Lux
-#   end
+# Next we actually run the training! 
