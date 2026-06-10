@@ -52,7 +52,8 @@
 # * Filtered out any other missing or NaN data 
 # * Saved the data directly in point-wise in a Zarr file 
 #
-# This combined and pre-processed data is avaliable at 
+# This combined and pre-processed data is available at
+# `/cluster/projects/nn9984k/speedy-data/era5-roughness.zarr` on the cluster.
 
 # ## Preparing the dataloaders 
 #
@@ -151,7 +152,7 @@ end
 # ## Train/validation loaders
 #
 # Then we code up the actual code to construct the data loaders.
-# Given, the loaded data from the Zarr store by `load_zarr_store` we initialize 
+# Given, the loaded data from the Zarr store by `load_zarr_dataset` we initialize
 # the `MLUtils.DataLoader`s with a train and validation split. That we can iterate
 # over during traning. 
 

@@ -219,11 +219,11 @@ function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFV
     names = String[v.name for v in vars]
     allunique(names) || error("variable names must be unique (they key the Zarr arrays); got $(names)")
 
-    # open each distinct file once and keep the handles for the whole run
+    ## open each distinct file once and keep the handles for the whole run
     datasets = Dict(p => NCDataset(p) for p in unique(v.path for v in vars))
     try
-        # chunks = list of (label, path -> time indices), subsampled by `time_stride`.
-        # `nothing` years -> the whole file as one chunk.
+        ## chunks = list of (label, path -> time indices), subsampled by `time_stride`.
+        ## `nothing` years -> the whole file as one chunk.
         chunks = if isnothing(years)
             [("all", Dict(p => subsample_time(1:length(datasets[p][time_name]), time_stride)
                           for p in keys(datasets)))]
@@ -235,8 +235,8 @@ function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFV
 
         verbose && @info "Preprocessing → $(zarr_path)" variables=length(vars) years=(isnothing(years) ? "all" : length(chunks))
 
-        # create the group; per-variable arrays are created lazily on first write,
-        # taking their feature-row count from the loaded slice.
+        ## create the group; per-variable arrays are created lazily on first write,
+        ## taking their feature-row count from the loaded slice.
         if overwrite && ispath(zarr_path)
             rm(zarr_path; recursive = true, force = true)
         end
@@ -246,22 +246,22 @@ function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFV
         ))
         arrays = Dict{String, Any}()
 
-        # optional static land-sea mask: a per-grid-point boolean reused every timestep.
-        # This file's variables are filled (not missing) over ocean, so this mask — not
-        # a NaN filter — is what restricts the output to land.
+        ## optional static land-sea mask: a per-grid-point boolean reused every timestep.
+        ## This file's variables are filled (not missing) over ocean, so this mask — not
+        ## a NaN filter — is what restricts the output to land.
         landvec = isnothing(landmask) ? nothing : load_landseamask(landmask, landmask_threshold)
         verbose && !isnothing(landvec) &&
             @info "  land-sea mask" land_points=count(landvec) grid_points=length(landvec) threshold=landmask_threshold
 
         total_kept = total_seen = 0
         for (label, idxmap) in chunks
-            # skip a requested year that is absent from any file
+            ## skip a requested year that is absent from any file
             if any(idxmap[v.path] isa AbstractVector && isempty(idxmap[v.path]) for v in vars)
                 verbose && @warn "  year $(label): no data in at least one file, skipping"
                 continue
             end
 
-            # load and column-flatten every variable for this chunk
+            ## load and column-flatten every variable for this chunk
             fields = Dict{String, Any}()
             for v in vars
                 t = time()
@@ -269,8 +269,8 @@ function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFV
                 verbose && @info "  $(label) · loaded $(v.name)" features=size(fields[v.name], 1) samples=size(fields[v.name], 2) seconds=round(time() - t; digits = 2)
             end
 
-            # column selector: the land points (tiled across this chunk's timesteps,
-            # since samples run space-fastest then time), or all columns if no mask.
+            ## column selector: the land points (tiled across this chunk's timesteps,
+            ## since samples run space-fastest then time), or all columns if no mask.
             nseen = size(fields[vars[1].name], 2)
             cols = if isnothing(landvec)
                 Colon()
@@ -284,7 +284,7 @@ function preprocess_to_zarr(inputs::AbstractVector{<:NetCDFVar}, target::NetCDFV
             total_seen += nseen
             total_kept += k
 
-            # append the selected columns; assert they are clean rather than filtering.
+            ## append the selected columns; assert they are clean rather than filtering.
             if k > 0
                 for v in vars
                     f = fields[v.name][:, cols]

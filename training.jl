@@ -99,8 +99,8 @@ function train_model(model, train_loader, val_loader = nothing;
     best_val, best_epoch, stale = Inf, 0, 0               # early-stopping bookkeeping
     best_ps = best_st = nothing                           # snapshot of best weights
 
-    # per-epoch CSV log of the losses, flushed every epoch so it survives a crash
-    # or early stop and can be plotted / `tail -f`'d while training is still running
+    ## per-epoch CSV log of the losses, flushed every epoch so it survives a crash
+    ## or early stop and can be plotted / `tail -f`'d while training is still running
     io = isnothing(history_path) ? nothing : open(history_path, "w")
     if !isnothing(io)
         println(io, "epoch,train,val")
@@ -109,7 +109,7 @@ function train_model(model, train_loader, val_loader = nothing;
 
     try
     for epoch in 1:epochs
-        # --- one pass over the training data ---
+        ## --- one pass over the training data ---
         running, nbatches = 0.0, 0
         for (x, y) in train_loader
             x, y = device(x), device(y)
@@ -121,20 +121,20 @@ function train_model(model, train_loader, val_loader = nothing;
         train_loss = running / max(nbatches, 1)
         push!(history.train, train_loss)
 
-        # --- validation (no parameter update) ---
+        ## --- validation (no parameter update) ---
         val_loss = isnothing(val_loader) ? NaN :
             evaluate(model, train_state.parameters, train_state.states, val_loader; lossfn, device)
         push!(history.val, val_loss)
 
         verbose && @printf("epoch %4d   train %.5f   val %.5f\n", epoch, train_loss, val_loss)
 
-        # --- persist the losses for later plotting ---
+        ## --- persist the losses for later plotting ---
         if !isnothing(io)
             @printf(io, "%d,%.8f,%.8f\n", epoch, train_loss, val_loss)
             flush(io)
         end
 
-        # --- early stopping: track the best epoch and stop when patience runs out ---
+        ## --- early stopping: track the best epoch and stop when patience runs out ---
         if early_stop
             if val_loss < best_val - min_delta
                 best_val, best_epoch, stale = val_loss, epoch, 0
@@ -153,7 +153,7 @@ function train_model(model, train_loader, val_loader = nothing;
         isnothing(io) || close(io)
     end
 
-    # restore the best-validation weights when early stopping was active
+    ## restore the best-validation weights when early stopping was active
     out_ps = isnothing(best_ps) ? train_state.parameters : best_ps
     out_st = isnothing(best_st) ? train_state.states : best_st
 
@@ -216,23 +216,40 @@ end
 # ## Now actually train it! 
 # 
 # Now, we actually train our model, save it and plot the training log. 
+# First some hyperparameters: 
+
+epochs = 100 # we have a lot of data, we won't need many
+patience = 10 # early stopping patience
+learning_rate = 1.0f-3
+csv_path = "training_results.csv"
+model_path = "trained_model.jld2"
+plot_path = "learning_curve.png"
+
+# Then, the actual training: 
 
 result = train_model(model, train_loader, val_loader;
     epochs, learning_rate, patience, device, history_path = csv_path, rng)
 
 @info "training finished" best_epoch = result.best_epoch best_val = result.best_val
 
+(; ps, st, history) =  result 
+save_model(model_path, model, ps, st; stats, history)
+
 # and a  plot of the loss curve: 
 
 using CairoMakie
 
-fig = Figure()
-ax = Axis(fig[1, 1]; xlabel = "epoch", ylabel = "loss", yscale = log10, title = "training loss")
-lines!(ax, result.history.train; label = "train")
-any(!isnan, result.history.val) && lines!(ax, result.history.val; label = "val")
-axislegend(ax)
-save(plot_path, fig)
+PLOT = false 
+if PLOT # hide it away in case we execute this on a compute node without graphics
+    fig = Figure()
+    ax = Axis(fig[1, 1]; xlabel = "epoch", ylabel = "loss", yscale = log10, title = "training loss")
+    lines!(ax, result.history.train; label = "train")
+    any(!isnan, result.history.val) && lines!(ax, result.history.val; label = "val")
+    axislegend(ax)
+    save(plot_path, fig)
+end 
 
-# As you see 
-# 
-# Next, we'll integrate it in SpeedyWeather.jl and see if it works there as well! 
+# The plot shows the train and validation loss per epoch, so convergence,
+# overfitting and the early-stopping point are easy to spot.
+#
+# Next, we'll integrate it in SpeedyWeather.jl and see if it works there as well!

@@ -22,25 +22,25 @@
 #
 # Okay, let's go! First we define the `struct` and it's constructor:
 
-using Adapt, Random
+using SpeedyWeather, Lux, Adapt, Random
 
 @kwdef struct LearnedSurfaceRoughness{NF, V, M, LNN, LP, LS} <: SpeedyWeather.AbstractSurfaceRoughness
     "[OPTION] constant roughness length over ocean [m]"
     roughness_length_ocean::NF = 1.0e-4
 
-    # learned land roughness parameters
-    # Land normalisation parameters (NamedTuples keyed by the inputs used in
-    # surface_roughness_land) to normalize NN inputs
+    ## learned land roughness parameters
+    ## Land normalisation parameters (NamedTuples keyed by the inputs used in
+    ## surface_roughness_land) to normalize NN inputs
     land_input_means::M
     land_input_stds::M
 
     land_output_mean::NF = -5.031811f0
     land_output_std::NF = 2.4447718f0
 
-    # input buffer for NN input so that we don't need to allocate it every time
+    ## input buffer for NN input so that we don't need to allocate it every time
     land_input_buffer::V
 
-    # NN structure, parameters and states
+    ## NN structure, parameters and states
     land_nn::LNN
     land_params::LP
     land_states::LS
@@ -56,7 +56,7 @@ function LearnedSurfaceRoughness(
         kwargs...
     )
 
-    # we allocate the input buffer on the same device we are running the model on
+    ## we allocate the input buffer on the same device we are running the model on
     land_input_buffer = on_architecture(SG.architecture, zeros(Float32, 7))
 
     return LearnedSurfaceRoughness{
@@ -85,8 +85,9 @@ Adapt.@adapt_structure LearnedSurfaceRoughness
 
 SpeedyWeather.initialize!(::LearnedSurfaceRoughness, ::PrimitiveEquation) =  nothing
 
-# Now, the core computation that collects the input variables, normalizes them, 
-# applies the neural network and then writes this into # * `vars.parameterizations.ocean.surface_roughness`,
+# Now, the core computation that collects the input variables, normalizes them,
+# applies the neural network and then writes the result into
+# `vars.parameterizations.ocean.surface_roughness`,
 # `vars.parameterizations.land.surface_roughness`, and `vars.parameterizations.surface_roughness`.
 
 @inline function normalise(a, m, s)
@@ -95,8 +96,8 @@ end
 
 Base.@propagate_inbounds function surface_roughness_land(ij, vars, scheme::LearnedSurfaceRoughness)
     
-    # we collect all inputs for the NN from our state variables
-    # this doesn't allocate it's just a shorthand 
+    ## we collect all inputs for the NN from our state variables
+    ## this doesn't allocate it's just a shorthand 
     vₕ = vars.parameterizations.land.vegetation_high[ij]
     vₗ =  vars.parameterizations.land.vegetation_low[ij]
     vᵦ = 1 - vₕ - vₗ  # bare soil fraction
@@ -105,7 +106,7 @@ Base.@propagate_inbounds function surface_roughness_land(ij, vars, scheme::Learn
     soil_moisture = vars.prognostic.land.soil_moisture[ij, begin]  # currently top layer
     soil_temperature = vars.prognostic.land.soil_temperature[ij, begin]  # top layer (matches stl1)
 
-    # Normalise inputs
+    ## Normalise inputs
     vₕ = normalise(vₕ, scheme.land_input_means.vegetation_high, scheme.land_input_stds.vegetation_high)
     vₗ = normalise(vₗ, scheme.land_input_means.vegetation_low, scheme.land_input_stds.vegetation_low)
     vᵦ = normalise(vᵦ, scheme.land_input_means.bare_soil, scheme.land_input_stds.bare_soil)
@@ -114,13 +115,13 @@ Base.@propagate_inbounds function surface_roughness_land(ij, vars, scheme::Learn
     soil_moisture = normalise(soil_moisture, scheme.land_input_means.soil_moisture, scheme.land_input_stds.soil_moisture)
     soil_temperature = normalise(soil_temperature, scheme.land_input_means.soil_temperature, scheme.land_input_stds.soil_temperature)
 
-    # write into input buffer for NN 
+    ## write into input buffer for NN 
     scheme.land_input_buffer[:] .= (vᵦ, vₕ, vₗ, g, sd, soil_temperature, soil_moisture)
 
-    # apply NN 
+    ## apply NN 
     prediction, _ = Lux.apply(scheme.land_nn, scheme.land_input_buffer, scheme.land_params, scheme.land_states)
     
-    # unnormalise and return 
+    ## unnormalise and return 
     log_surface_roughness = (prediction[1] * scheme.land_output_std) + scheme.land_output_mean
     surface_roughness = exp(log_surface_roughness)
     return surface_roughness
@@ -129,12 +130,12 @@ end
 Base.@propagate_inbounds function SpeedyWeather.surface_roughness!(ij, vars, scheme::LearnedSurfaceRoughness, land_sea_mask)
     land_fraction = land_sea_mask.mask[ij]
 
-    # Compute separate ocean and land surface roughness
-    # (ocean roughness where there is any ocean, land roughness where there is any land)
+    ## Compute separate ocean and land surface roughness
+    ## (ocean roughness where there is any ocean, land roughness where there is any land)
     vars.parameterizations.ocean.surface_roughness[ij] = ifelse(land_fraction < 1, scheme.roughness_length_ocean, zero(land_fraction))
     vars.parameterizations.land.surface_roughness[ij] = ifelse(land_fraction > 0, surface_roughness_land(ij, vars, scheme), zero(land_fraction))
 
-    # Blend the two via arithmetic average
+    ## Blend the two via arithmetic average
     vars.parameterizations.surface_roughness[ij] = land_fraction * vars.parameterizations.land.surface_roughness[ij] + (1 - land_fraction) * vars.parameterizations.ocean.surface_roughness[ij]
     return nothing
 end
