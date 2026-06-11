@@ -70,13 +70,45 @@ surface_roughness = LearnedSurfaceRoughness(
 boundary_layer = BoundaryLayer(spectral_grid; surface_roughness)
 model = PrimitiveWetModel(spectral_grid; boundary_layer)
 simulation = initialize!(model)
-run!(simulation, steps = 2)
+run!(simulation, period=Day(20))
 
 # As a quick sanity check, the range of the surface roughness our network
 # predicted over land (in meters, after undoing the log and the normalisation;
 # the zero minimum is simply the ocean points of the land field):
 
 extrema(simulation.variables.parameterizations.land.surface_roughness)
+
+# ## Comparing to ERA5
+#
+# For a simple visual comparison we plot the current surface roughness of the
+# simulation next to the ERA5 surface roughness. Roughness
+# spans several orders of magnitude, so we plot `log10` of both.
+
+using NCDatasets, CairoMakie
+
+era5_file = "/p/projects/ou/labs/ai/max/era5-roughness-2022-2025.nc"
+lon, lat, z₀_era5 = NCDataset(era5_file) do ds
+    ds["longitude"][:], ds["latitude"][:], Float32.(ds["fsr"][:, :, 1])
+end
+
+## shift ERA5 from -180–180°E to 0–360°E so both maps share the same layout
+z₀_era5 = circshift(z₀_era5, (720, 0))
+lon360  = mod.(circshift(lon, 720), 360)
+
+## the simulation field as a (lon, lat) matrix on its full grid
+z₀_field = simulation.variables.parameterizations.land.surface_roughness
+z₀_full = RingGrids.interpolate(RingGrids.full_grid_type(z₀_field.grid), z₀_field.grid.nlat_half, z₀_field)
+z₀_sim, lond, latd = Matrix(z₀_full), RingGrids.get_lond(z₀_full), RingGrids.get_latd(z₀_full)
+
+clims = (-4, 0.5)   ## log₁₀ of roughness in meters
+fig = Figure(size = (800, 650))
+ax1 = Axis(fig[1, 1]; title = "Learned surface roughness (SpeedyWeather, T32)")
+hm = heatmap!(ax1, lond, latd, log10.(max.(z₀_sim, 1f-6)); colorrange = clims)  ## ocean is 0 -> clipped
+ax2 = Axis(fig[2, 1]; title = "ERA5 fsr (first snapshot)", xlabel = "longitude")
+heatmap!(ax2, lon360, lat, log10.(z₀_era5); colorrange = clims)
+Colorbar(fig[:, 2], hm, label = "log₁₀ surface roughness [m]")
+CairoMakie.save("surface_roughness_comparison.png", fig)   ## qualified: JLD2 also exports `save`
+fig
 
 # ## Outlook: running on the GPU
 #
