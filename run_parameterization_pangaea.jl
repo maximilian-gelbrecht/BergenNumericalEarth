@@ -127,8 +127,10 @@ surface_roughness = LearnedSurfaceRoughness(
     land_input_means, land_input_stds;
     land_output_mean, land_output_std)
 
+boundary_layer = BoundaryLayer(spectral_grid; surface_roughness)
+
 model = PrimitiveWetModel(spectral_grid;
-    orography, land_sea_mask, ocean, albedo, land, surface_roughness)
+    orography, land_sea_mask, ocean, albedo, land, boundary_layer)
 
 simulation = initialize!(model)
 run!(simulation, period = Day(20))
