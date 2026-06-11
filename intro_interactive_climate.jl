@@ -263,11 +263,19 @@ record(fig, "zonal_wind.mp4", 1:n_steps; framerate=10) do t
     ax.title = "Surface zonal wind, time step $(t_range[t])"
 end
 
-# ## One Global GPU Example 
-# TODO: finish this 
+# ## One Global GPU Example
+#
+# Finally, let's put everything together for one high-resolution global simulation on the GPU.
+# This is a main selling point of interactive climate modelling with NumericalEarth:
+# the model code stays exactly the same, we only exchange the `architecture` of the
+# `SpectralGrid`. We guard the choice with `CUDA.functional()` so that this script also
+# runs (much slower though!) on machines without an Nvidia GPU:
+
+using CUDA
+arch = CUDA.functional() ? SpeedyWeather.GPU() : SpeedyWeather.CPU()
 
 ## 1. define the resolution and grid, change what you like
-spectral_grid = SpectralGrid(trunc=256, nlayers=16, architecture = SpeedyWeather.GPU())
+spectral_grid = SpectralGrid(trunc=256, nlayers=16, architecture=arch)
 
 ## 2. create a model
 model = PrimitiveWetModel(spectral_grid)
@@ -276,8 +284,58 @@ model = PrimitiveWetModel(spectral_grid)
 simulation = SpeedyWeather.initialize!(model)
 
 ## 4. and then run the model
-SpeedyWeather.run!(simulation, period=Day(30), output=true)
+n_days = 30
+SpeedyWeather.run!(simulation, period=Day(n_days), output=true)
 
-# Then let's visualize the results: 
-# TODO 
+# How fast was that? The progress meter of the model's `feedback` component already
+# tracks the wallclock time of the run (it is reinitialized at the start of the time
+# stepping for benchmark accuracy), so we can read the elapsed time directly from it:
+
+pm = model.feedback.progress_meter.core
+elapsed = pm.tlast - pm.tinit             # wallclock time of the run in seconds
+sypd = (n_days / 365.25) * 86400 / elapsed  # simulated years per wallclock day
+println("$n_days simulated days took $(round(elapsed, digits=1)) s, that's $(round(sypd, digits=1)) simulated years per day.")
+
+# Try to rerun this section with `arch = SpeedyWeather.CPU()` or with a different `trunc`
+# and compare: how much faster is the GPU, and how does the gap change with resolution?
+
+# Then let's visualize the results: at T256 (about 50 km grid spacing) the flow is full of
+# sharp fronts and small-scale eddies that the coarser runs from above simply can't resolve.
+# The surface relative vorticity shows them off best. Let's look at the last snapshot:
+
+ds = NCDataset(joinpath(model.output.run_path, model.output.filename))
+
+lon, lat = ds["lon"][:], ds["lat"][:]
+i_layer = size(ds["vor"], 3)  # with nlayers=16 the lowest model layer is now 16, not 8!
+
+n_steps = min(100, size(ds["vor"], 4))
+t_range = (size(ds["vor"], 4) - n_steps + 1):size(ds["vor"], 4)  # slice from the end of the run
+vor_anim = nomissing(ds["vor"][:, :, i_layer, t_range], NaN)
+vor_max = maximum(abs, vor_anim)  # fixed, symmetric colorrange as before
+
+fig = Figure(size=(900, 450))
+ax = Axis(fig[1, 1], title="Surface relative vorticity after $n_days days",
+          xlabel="Longitude [˚E]", ylabel="Latitude [˚N]")
+hm = heatmap!(ax, lon, lat, vor_anim[:, :, end], colormap=:balance, colorrange=(-vor_max, vor_max))
+Colorbar(fig[1, 2], hm, label="Vorticity [1/s]")
+fig
+
+# We reuse our animation recipe once more,
+# again on the slice from the end of the run:
+
+i_time = Observable(1)
+vor_frame = @lift vor_anim[:, :, $i_time]
+
+fig, ax, hm = heatmap(lon, lat, vor_frame, colormap=:balance, colorrange=(-vor_max, vor_max),
+                      axis=(xlabel="Longitude [˚E]", ylabel="Latitude [˚N]"))
+Colorbar(fig[1, 2], hm, label="Relative vorticity [1/s]")
+
+record(fig, "vorticity_gpu.mp4", 1:n_steps; framerate=10) do t
+    i_time[] = t
+    ax.title = "Surface relative vorticity, time step $(t_range[t])"
+end
+
+# That's it! You have run atmospheric simulations from your laptop's CPU all the way to a
+# high-resolution GPU run, configured grids, time stepping and orography along the way.
+# Experiment a bit further and configure your own simulation!
 
