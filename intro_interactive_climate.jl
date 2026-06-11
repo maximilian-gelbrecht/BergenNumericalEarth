@@ -221,19 +221,53 @@ heatmap(model.orography.orography, title="Orography [m]: Is it supposed to be a 
 ## when you reinitialize the model, you have to change the orography after the `simulation = initialize!(model)`!
 SpeedyWeather.run!(simulation, period=Day(20), output=true)
 
-# Let's have a look if we see a trace of what we changed:
+# Let's have a look if we see a trace of what we changed. The zonal wind ``u`` shows the
+# imprint of the orography most clearly: the flow is blocked and deflected by the ridges
+# and excites stationary waves downstream of the mountains. Compare the wind field with
+# the orography we plotted above!
 
-## TODO: do a nicer plot here
 ds = NCDataset(joinpath(model.output.run_path, model.output.filename))
-i_layer = 8 # that's the closest layer to the surface
-time_step = 30
-heatmap(ds["vor"][:,:,i_layer,time_step])
+
+lon, lat = ds["lon"][:], ds["lat"][:]
+i_layer = 8               # that's the closest layer to the surface
+t_end = size(ds["u"], 4)  # last output time step, after the flow adjusted to the orography
+
+u_end = nomissing(ds["u"][:, :, i_layer, t_end], NaN)
+u_max = maximum(abs, u_end) # symmetric colorrange: easterlies blue, westerlies red
+
+fig = Figure(size=(800, 400))
+ax = Axis(fig[1, 1], title="Surface zonal wind after 20 days",
+          xlabel="Longitude [˚E]", ylabel="Latitude [˚N]")
+hm = heatmap!(ax, lon, lat, u_end, colormap=:balance, colorrange=(-u_max, u_max))
+Colorbar(fig[1, 2], hm, label="u [m/s]")
+fig
+
+# And we can reuse our animation recipe from above, this time animating the zonal wind
+# over (up to) the last 100 output time steps:
+
+n_steps = min(100, size(ds["u"], 4))
+t_range = (size(ds["u"], 4) - n_steps + 1):size(ds["u"], 4)  # slice from the end of the run
+u_anim = nomissing(ds["u"][:, :, i_layer, t_range], NaN)
+
+i_time = Observable(1)
+u_frame = @lift u_anim[:, :, $i_time]
+
+u_anim_max = maximum(abs, u_anim) # again a fixed, symmetric colorrange for all frames
+fig, ax, hm = heatmap(lon, lat, u_frame, colormap=:balance,
+                      colorrange=(-u_anim_max, u_anim_max),
+                      axis=(xlabel="Longitude [˚E]", ylabel="Latitude [˚N]"))
+Colorbar(fig[1, 2], hm, label="Zonal wind [m/s]")
+
+record(fig, "zonal_wind.mp4", 1:n_steps; framerate=10) do t
+    i_time[] = t
+    ax.title = "Surface zonal wind, time step $(t_range[t])"
+end
 
 # ## One Global GPU Example 
 # TODO: finish this 
 
 ## 1. define the resolution and grid, change what you like
-spectral_grid = SpectralGrid(trunc=127, nlayers=16, architecture = SpeedyWeather.GPU())
+spectral_grid = SpectralGrid(trunc=256, nlayers=16, architecture = SpeedyWeather.GPU())
 
 ## 2. create a model
 model = PrimitiveWetModel(spectral_grid)
