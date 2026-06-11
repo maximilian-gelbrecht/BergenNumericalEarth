@@ -163,4 +163,4 @@ fig
 
 # Spatial generalisation in action: a parameterization learned from ERA5 maps,
 # applied to a planet that hasn't existed for 250 million years — because the
-# network learned the *function*, not the map.
+# network learned the *function*, not the map. T-Rex would be proud! 
