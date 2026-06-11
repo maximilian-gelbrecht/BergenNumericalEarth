@@ -1,4 +1,11 @@
-# Preprocessing: global NetCDF fields -> column-wise Zarr store prepared for dataloaders
+# # Preprocessing: global NetCDF fields -> column-wise Zarr store prepared for dataloaders
+#
+# You can savely ignore this file / notebook. This ist just here for completness of the example. 
+# We already prepared and preprocessed the data for you. The raw ERA5 files are not saved on the 
+# server. Just skip ahead to the next notebook. 
+#
+ 
+# ## Preprocessing pipeline
 #
 #   1. Read the requested variables from one big multi-year NetCDF file, loading only
 #      a single year's time-slice into RAM at a time.
