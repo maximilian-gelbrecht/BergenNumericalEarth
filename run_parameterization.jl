@@ -86,7 +86,8 @@ extrema(simulation.variables.parameterizations.land.surface_roughness)
 
 using NCDatasets, CairoMakie
 
-era5_file = "era5-roughness-snapshot.nc"
+era5_file = "/cluster/projects/nn9984k/speedy-data/era5-roughness-snapshot.nc"
+#era5_file = "era5-roughness-snapshot.nc"
 lon, lat, z₀_era5 = NCDataset(era5_file) do ds
     ds["longitude"][:], ds["latitude"][:], Float32.(ds["fsr"][:, :])
 end
