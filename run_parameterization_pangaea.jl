@@ -1,22 +1,18 @@
-# # Generalisability: the learned roughness on Planet Pangaea
+# # Generalisability: the learned roughness on Pangaea
 #
 # The strongest argument for learning the surface roughness as a *column-based*
 # function of local surface variables — rather than hard-coding another boundary
 # condition map — is that it generalises: the network doesn't know anything about
 # Earth's geography, only about the relation between a column's surface state and
-# its roughness. So nothing stops us from applying it to a planet whose geography
-# the network has never seen.
+# its roughness. It will also work with significant land use change in climate simulations, 
+# or for paleo simulations. Even paleo simulations with dinosaurs! So nothing stops us from 
+# applying it to a planet Earth with Pangaea still existing!
 #
-# Here we do exactly that: we repeat the online simulation of
-# [`run_parameterization.jl`](run_parameterization.jl), but on **Pangaea**, using the
+# Here we do exactly that: we repeat the simulation of
+# [`run_parameterization.jl`](run_parameterization.jl), but with **Pangaea**, using the
 # boundary conditions provided by
-# [PlanetPangaea.jl](https://github.com/SpeedyWeather/PlanetPangaea.jl) —
-# "climate modelling for dinosaurs". The package ships a full set of
-# SpeedyWeather-ready NetCDF files (generated from an Olenekian Pangaea
-# reconstruction image): land-sea mask, orography, high/low vegetation cover,
-# a 12-month soil-moisture climatology, a 12-month SST climatology, and albedo.
-# Conveniently they use exactly the variable names and grid layout that
-# SpeedyWeather's boundary-condition components expect.
+# [PlanetPangaea.jl](https://github.com/SpeedyWeather/PlanetPangaea.jl) (credit to Greg
+# Munday / U Oxford).
 
 import Pkg
 Pkg.activate(".")
@@ -43,62 +39,14 @@ for file in pangaea_files
 end
 readdir(pangaea_dir)
 
-# ## Fill the masked seasonal fields
-#
-# PlanetPangaea masks its seasonal fields with `NaN`: the soil moisture is `NaN`
-# over the ocean and the SST is `NaN` over land. SpeedyWeather's climatology
-# components interpolate these files onto the model grid as they are — and around
-# the coasts that smears `NaN` into cells with *fractional* land. There the learned
-# roughness would read `NaN` soil moisture, and the surface heat flux would read
-# `NaN` SST: one contaminated coastal cell is enough to blow up the whole
-# simulation within a time step (SpeedyWeather's own asset files are gap-free over
-# the coasts for exactly this reason).
-#
-# So we fill the masked regions once with their nearest valid values — the same
-# trick PlanetPangaea's generator uses internally before it re-masks. The filled
-# values only ever matter in coastal cells: fluxes are weighted by the land
-# fraction, so over pure ocean/land they have no effect.
-
-using NCDatasets
-
-"Replace NaNs by the mean of their finite neighbours, iterated until none are left (lon wraps around)."
-function fill_nans!(A::AbstractMatrix)
-    nlon, nlat = size(A)
-    while any(isnan, A)
-        B = copy(A)
-        for j in 1:nlat, i in 1:nlon
-            if isnan(A[i, j])
-                s = 0.0f0; n = 0
-                for (di, dj) in ((1, 0), (-1, 0), (0, 1), (0, -1))
-                    ii = mod1(i + di, nlon)              ## periodic in longitude
-                    jj = clamp(j + dj, 1, nlat)
-                    if !isnan(A[ii, jj]); s += A[ii, jj]; n += 1; end
-                end
-                n > 0 && (B[i, j] = s / n)
-            end
-        end
-        A .= B
-    end
-    return A
-end
-
-"Copy `src` to `dst` (once) and fill the NaNs of all `varnames`, month by month."
-function fill_file(src, dst, varnames)
-    isfile(dst) && return dst
-    cp(src, dst)
-    NCDataset(dst, "a") do ds
-        for var in varnames, t in 1:ds.dim["time"]
-            slice = Float32.(coalesce.(ds[var][:, :, t], NaN32))
-            ds[var][:, :, t] = fill_nans!(slice)
-        end
-    end
-    return dst
-end
-
-soil_moisture_path = fill_file(joinpath(pangaea_dir, "soil_moisture.nc"),
-    joinpath(pangaea_dir, "soil_moisture_filled.nc"), ("swl1", "swl2"))
-sst_path = fill_file(joinpath(pangaea_dir, "sst.nc"),
-    joinpath(pangaea_dir, "sst_filled.nc"), ("sst",))
+# All fields come gap-free: the SST continues smoothly under land and the soil
+# moisture under the ocean, so SpeedyWeather can interpolate them onto any model
+# grid without `NaN` ever reaching a coastal cell with fractional land — the
+# filled values only ever matter at coasts, since fluxes are weighted by the land
+# fraction. (Earlier versions of the files masked these regions with `NaN`, which
+# blew up the simulation within a time step and required filling them manually —
+# fixed upstream.) The vegetation file also carries the leaf area index
+# (`lai_hv`, `lai_lv`), which we don't use here.
 
 # ## Import the trained model
 #
@@ -143,13 +91,10 @@ land_output_std  = stats.target_std[1]
 #
 # The PlanetPangaea files use the standard variable names (`lsm`, `orog`,
 # `vegh`/`vegl`, `swl1`/`swl2`, `sst`, `alb`) on a regular 384×192 longitude–latitude
-# grid, which matches the layout of a full Gaussian grid with 192 rings — so the
-# components' default `FullGaussianField` wrapping applies. Only the land-sea mask
-# needs its `FieldType` overridden (its default expects the Earth asset file, which
-# comes on a different grid).
+# grid.
 
 arch = SpeedyWeather.CPU()
-spectral_grid = SpectralGrid(trunc = 32, architecture = arch)
+spectral_grid = SpectralGrid(trunc = 127, architecture = arch)
 
 orography = EarthOrography(spectral_grid,
     path = joinpath(pangaea_dir, "orography.nc"), from_assets = false)
@@ -159,27 +104,23 @@ land_sea_mask = EarthLandSeaMask(spectral_grid,
     FieldType = FullGaussianField)
 
 ocean = SeasonalOceanClimatology(spectral_grid,
-    path = sst_path, from_assets = false)
+    path = joinpath(pangaea_dir, "sst.nc"), from_assets = false)
 
 albedo = AlbedoClimatology(spectral_grid,
     path = joinpath(pangaea_dir, "albedo.nc"), from_assets = false)
-
-# The land surface needs the vegetation cover (a direct input of our network!) and
-# the seasonal soil moisture; both are components of the `LandModel`. Snow depth and
-# soil temperature stay prognostic, as on Earth.
 
 vegetation = VegetationClimatology(spectral_grid,
     path = joinpath(pangaea_dir, "vegetation.nc"), from_assets = false)
 
 soil_moisture = SeasonalSoilMoisture(spectral_grid,
-    path = soil_moisture_path, from_assets = false)
+    path = joinpath(pangaea_dir, "soil_moisture.nc"), from_assets = false)
 
 land = LandModel(spectral_grid; vegetation, soil_moisture)
 
 # ## Run Pangaea with the learned surface roughness
 #
 # The learned scheme is constructed exactly as on Earth — it is the same network,
-# the same weights, the same normalisation. Only the planet underneath changes.
+# the same weights, the same normalisation. Only the continents underneath changes.
 
 surface_roughness = LearnedSurfaceRoughness(
     spectral_grid, land_nn, land_params, land_states,
@@ -191,11 +132,6 @@ model = PrimitiveWetModel(spectral_grid;
 
 simulation = initialize!(model)
 run!(simulation, period = Day(20))
-
-# The range of the predicted roughness over land (in meters; the zero minimum is
-# the ocean part of the land field):
-
-extrema(simulation.variables.parameterizations.land.surface_roughness)
 
 # ## Roughness of a supercontinent
 #
@@ -216,7 +152,7 @@ z₀_sim, lond, latd = to_lonlat(simulation.variables.parameterizations.land.sur
 vegh_sim, _, _     = to_lonlat(model.land.vegetation.high_cover)
 
 fig = Figure(size = (800, 650))
-ax1 = Axis(fig[1, 1]; title = "Learned surface roughness on Pangaea (T32)")
+ax1 = Axis(fig[1, 1]; title = "Learned surface roughness on Pangaea (T$(spectral_grid.trunc))")
 hm1 = heatmap!(ax1, lond, latd, log10.(max.(z₀_sim, 1f-6)); colorrange = (-4, 0.5))
 Colorbar(fig[1, 2], hm1, label = "log₁₀ z₀ [m]")
 ax2 = Axis(fig[2, 1]; title = "High vegetation cover (PlanetPangaea)", xlabel = "longitude")
