@@ -5,14 +5,14 @@
 # introduce some basic concepts that both models share and then later actually run some 
 # simulations with SpeedyWeather. Let's go step by step through all ingredients that we need! 
 #
-# ## Devices and architectures: Where do run our model? 
+# ## Devices and architectures: Where do we run our model?
 #
 # First, we will have to set up the device we want to run our model on. 
 
 using SpeedyWeather, Oceananigans
 
 arch = SpeedyWeather.CPU()
-# arch = SpeedyWeather.GPU() 
+## arch = SpeedyWeather.GPU()
 
 # with this architecture, we can also transfer data between devices with this: 
 
@@ -24,7 +24,7 @@ A_cpu = SpeedyWeather.on_architecture(arch, A)
 #
 # ## Grids and discretization 
 #
-# Next, we will have to set up the grid we want to discretize our model on. SpeedyWeather.jl is a spectral (or rather pseudo-spectral) model with variables discretized both in spectral space and in grid space. Oceananigans is a FVM model with just a central grid space discretization. For SpeedyWeather we therefore have a `SpectralGrid` as an object that bundles spectral and grid discretization information, we initalize it with an argument for the spectral truncation `trunc` that sets the maximum degree and order of the spherical harmonics (and therefore the resolution), and the number of vertical layers `nlayers` that we discretize the model in.
+# Next, we will have to set up the grid we want to discretize our model on. SpeedyWeather.jl is a spectral (or rather pseudo-spectral) model with variables discretized both in spectral space and in grid space. Oceananigans is a FVM model with just a central grid space discretization. For SpeedyWeather we therefore have a `SpectralGrid` as an object that bundles spectral and grid discretization information, we initialize it with an argument for the spectral truncation `trunc` that sets the maximum degree and order of the spherical harmonics (and therefore the resolution), and the number of vertical layers `nlayers` that we discretize the model in.
 
 spectral_grid = SpectralGrid(trunc=31, nlayers=8, architecture = arch)
 
@@ -51,7 +51,7 @@ latitude_longitude_grid = LatitudeLongitudeGrid(size = (60, 30, 1),
 # In SpeedyWeather we have a `LowerTriangularArray` that hold an array and a `Spectrum` and a `Field` that hold an array and a `Grid`. 
 # In Oceananigans we just have a `Field`. Let's initialize one! 
 
-A = rand(spectral.grid) 
+A = rand(spectral_grid.grid)
 
 # Well, that was easy! We can also use the `set!` function in both packages to set values: 
 
@@ -63,7 +63,7 @@ SpeedyWeather.set!(A, 1.0)
 
 model = PrimitiveWetModel(spectral_grid)
 
-# The model byitself doesn't hold all necessarry pre-computed fields yet and also not all information required for an experiment. We get those by initializing the model which yields a `Simulation`:
+# The model by itself doesn't hold all necessary pre-computed fields yet and also not all information required for an experiment. We get those by initializing the model which yields a `Simulation`:
 
 simulation = SpeedyWeather.initialize!(model)
 
@@ -75,9 +75,6 @@ SpeedyWeather.run!(simulation, period=Day(10), output=true)
 
 # ## And what about Oceananigans? 
 # The analogous quick start to run a model is very similar. Again, as with SpeedyWeather we define the architecture, then grid with the resolution, then the model, then we initialize the `Simulation`, and finally we `run!` the model: 
-
-using Oceananigans
-
 ## set the architecture
 arch = Oceananigans.CPU()
 
@@ -89,7 +86,7 @@ ocean_model = NonhydrostaticModel(grid; advection=WENO())
 
 ## set an initial condition 
 ϵ(x, y) = 2rand() - 1
-set!(ocean_model, u=ϵ, v=ϵ)
+Oceananigans.set!(ocean_model, u=ϵ, v=ϵ)
 
 ## initialize the simulation and run it!
 ocean_simulation = Oceananigans.Simulation(ocean_model; Δt=0.01, stop_time=4)
@@ -103,7 +100,7 @@ Oceananigans.run!(ocean_simulation)
 
 using NCDatasets, CairoMakie 
 
-ds = NCDataset(joinpath(model.output.run_path, model.output.filename)
+ds = NCDataset(joinpath(model.output.run_path, model.output.filename))
 
 # In the return you also directly see all the variables, that we saved. Let's first just plot some snapshots of the vorticity, and then we also animate it!
 
@@ -152,7 +149,7 @@ simulation.variables
 # A main advantage of our modelling approaches is that it is very easy to tailor a model to your needs, change parameters, but also whole model components, just a in a script. 
 # Later, on Wednesday, we'll even see how we can define a new machine learned model component that we can then use in a model!
 #
-# The documentations of [SpeedyWeather](https://speedyweather.github.io/SpeedyWeatherDocumentation/dev/), [Oceananigans](https://clima.github.io/OceananigansDocumentation/dev/) and [Breeze](https://github.com/NumericalEarth/Breeze.jl) provide an extensive recourses which components and processes are actually avaiable. 
+# The documentations of [SpeedyWeather](https://speedyweather.github.io/SpeedyWeatherDocumentation/dev/), [Oceananigans](https://clima.github.io/OceananigansDocumentation/dev/) and [Breeze](https://github.com/NumericalEarth/Breeze.jl) provide extensive resources on which components and processes are actually available.
 # Here, we'll just configure a very basic model, which we will then run with SpeedyWeather.jl. 
 
 # ### Change the time step
@@ -161,6 +158,7 @@ simulation.variables
 # needs to know the spatial resolution to pick a time step by default that is stable, but you can still control this.
 # SpeedyWeather's time integration is based on the `Leapfrog` scheme, so you create such a component like this
 
+spectral_grid = SpectralGrid(trunc = 32, architecture = SpeedyWeather.CPU())
 time_stepping = Leapfrog(spectral_grid, Δt_at_T31=Minute(20))
 
 # where the argument `Δt_at_T31` determines the timestep `Δt` (write `\Delta` then hit tab) relative to a truncation of
@@ -168,7 +166,6 @@ time_stepping = Leapfrog(spectral_grid, Δt_at_T31=Minute(20))
 # You can provide any `Second`, `Minute`, `Hour` (but note that there is a stability limit above which your simulation quickly blows up).
 # But do not forget to also pass this component to the model constructor, i.e.
 
-spectral_grid = SpectralGrid(trunc = 32, architecture = SpeedyWeather.CPU())
 model = PrimitiveWetModel(spectral_grid; time_stepping)
 
 # where `; time_stepping` matches a keyword argument `time_stepping` with the variable of the same name. This is equivalent
@@ -185,11 +182,11 @@ SpeedyWeather.run!(simulation, period=Day(10))
 # of longitude ``\lambda`` and latitude ``\varphi`` as outlined [here](https://speedyweather.github.io/SpeedyWeather.jl/dev/orography/#Changing-orography-manually). In brief, _after_ model initialization
 # (otherwise orography would also be initialized, overwriting your changes)
 
-## set to a global constant
-
 spectral_grid = SpectralGrid(trunc = 32, architecture = SpeedyWeather.CPU())
 model = PrimitiveWetModel(spectral_grid)
+simulation = SpeedyWeather.initialize!(model)
 
+## set to a global constant
 SpeedyWeather.set!(model, orography=0)
 
 ## add two 6000m ridges at +-30˚E from 60˚S to 60˚N
@@ -220,15 +217,16 @@ heatmap(model.orography.orography, title="Orography [m]: Is it supposed to be a 
 
 # You can try to play around with setting different orographies and then rerunning the model. What differences can you see?
 
-## paste in code to run the model from below and experiment a bit!, how different does the integration look like with this orography?
+## experiment a bit! how different does the integration look like with this orography?
 ## when you reinitialize the model, you have to change the orography after the `simulation = initialize!(model)`!
-run!(simulation, period=Day(20))
+SpeedyWeather.run!(simulation, period=Day(20), output=true)
 
-# Let's have a look if we see a trace of what we changed: 
+# Let's have a look if we see a trace of what we changed:
 
-## TODO: do a nicer plot here 
+## TODO: do a nicer plot here
+ds = NCDataset(joinpath(model.output.run_path, model.output.filename))
 i_layer = 8 # that's the closest layer to the surface
-time_step = 30 # we
+time_step = 30
 heatmap(ds["vor"][:,:,i_layer,time_step])
 
 # ## One Global GPU Example 
@@ -241,10 +239,10 @@ spectral_grid = SpectralGrid(trunc=127, nlayers=16, architecture = SpeedyWeather
 model = PrimitiveWetModel(spectral_grid)
 
 ## 3. then, initialize the model
-simulation = initialize!(model)
+simulation = SpeedyWeather.initialize!(model)
 
 ## 4. and then run the model
-run!(simulation, period=Day(30), output=true)
+SpeedyWeather.run!(simulation, period=Day(30), output=true)
 
 # Then let's visualize the results: 
 # TODO 
