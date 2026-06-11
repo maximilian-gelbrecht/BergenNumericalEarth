@@ -86,9 +86,9 @@ extrema(simulation.variables.parameterizations.land.surface_roughness)
 
 using NCDatasets, CairoMakie
 
-era5_file = "/p/projects/ou/labs/ai/max/era5-roughness-2022-2025.nc"
+era5_file = "era5-roughness-snapshot.nc"
 lon, lat, z₀_era5 = NCDataset(era5_file) do ds
-    ds["longitude"][:], ds["latitude"][:], Float32.(ds["fsr"][:, :, 1])
+    ds["longitude"][:], ds["latitude"][:], Float32.(ds["fsr"][:, :])
 end
 
 ## shift ERA5 from -180–180°E to 0–360°E so both maps share the same layout
